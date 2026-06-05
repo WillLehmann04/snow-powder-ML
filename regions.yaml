@@ -1,0 +1,174 @@
+# Ski resort configs for the powder forecasting ML system.
+#
+# snowjapan_slug : URL slug used at snowjapan.com/rest-api/skiarea/{slug}
+# snowjapan_id   : numeric ID used at snowjapan.com/rest-api/skiarea/snowfall/{id}
+#                  Discovered by POSTing to /rest-api/skiarea/{slug} and reading the Id field.
+# lat/lon        : resort summit or primary lift station (decimal degrees)
+# elevation      : metres above sea level (summit / upper station)
+# region         : sub-national grouping (categorical model feature)
+# hemisphere     : north | south (determines season-year logic)
+
+# ── Hokkaido ──────────────────────────────────────────────────────────────────
+niseko_grand_hirafu:
+  lat: 42.8643
+  lon: 140.7009
+  elevation: 1200
+  snowjapan_slug: niseko-mountain-resort-grand-hirafu
+  snowjapan_id: 369
+  region: hokkaido
+  hemisphere: north
+
+niseko_annupuri:
+  lat: 42.8989
+  lon: 140.6989
+  elevation: 1308
+  snowjapan_slug: niseko-annupuri-kokusai
+  snowjapan_id: 368
+  region: hokkaido
+  hemisphere: north
+
+rusutsu:
+  lat: 42.7498
+  lon: 140.9000
+  elevation: 994
+  snowjapan_slug: rusutsu-resort
+  snowjapan_id: 439
+  region: hokkaido
+  hemisphere: north
+
+furano:
+  lat: 43.2641
+  lon: 142.3834
+  elevation: 1077
+  snowjapan_slug: furano
+  snowjapan_id: 99
+  region: hokkaido
+  hemisphere: north
+
+kiroro:
+  lat: 43.0950
+  lon: 141.0080
+  elevation: 1180
+  snowjapan_slug: kiroro-snow-world
+  snowjapan_id: 243
+  region: hokkaido
+  hemisphere: north
+
+sahoro:
+  lat: 43.1040
+  lon: 143.0750
+  elevation: 1040
+  snowjapan_slug: sahoro-resort
+  snowjapan_id: 441
+  region: hokkaido
+  hemisphere: north
+
+# ── Tohoku (northern Honshu) ──────────────────────────────────────────────────
+zao:
+  lat: 38.1424
+  lon: 140.4588
+  elevation: 1661
+  snowjapan_slug: zao-onsen
+  snowjapan_id: 607
+  region: tohoku
+  hemisphere: north
+
+appi_kogen:
+  lat: 39.9520
+  lon: 141.0860
+  elevation: 1320
+  snowjapan_slug: appi-kogen
+  snowjapan_id: 27
+  region: tohoku
+  hemisphere: north
+
+geto_kogen:
+  lat: 39.2310
+  lon: 141.1300
+  elevation: 1159
+  snowjapan_slug: geto-kogen
+  snowjapan_id: 107
+  region: tohoku
+  hemisphere: north
+
+# ── Niigata / Nagano (central Honshu) ────────────────────────────────────────
+naeba:
+  lat: 36.9181
+  lon: 138.7215
+  elevation: 1789
+  snowjapan_slug: naeba
+  snowjapan_id: 344
+  region: niigata
+  hemisphere: north
+
+myoko_suginohara:
+  lat: 36.9940
+  lon: 138.1320
+  elevation: 1900
+  snowjapan_slug: myoko-suginohara
+  snowjapan_id: 343
+  region: niigata
+  hemisphere: north
+
+nozawaonsen:
+  lat: 36.9230
+  lon: 138.4530
+  elevation: 1650
+  snowjapan_slug: nozawa-onsen
+  snowjapan_id: 384
+  region: nagano
+  hemisphere: north
+
+hakuba_happo:
+  lat: 36.6984
+  lon: 137.8526
+  elevation: 1831
+  snowjapan_slug: hakuba-happo-one
+  snowjapan_id: 142
+  region: nagano
+  hemisphere: north
+
+hakuba_goryu:
+  lat: 36.6750
+  lon: 137.8350
+  elevation: 1676
+  snowjapan_slug: able-hakuba-goryu
+  snowjapan_id: 129
+  region: nagano
+  hemisphere: north
+
+shiga_kogen:
+  lat: 36.7908
+  lon: 138.5110
+  elevation: 2307
+  snowjapan_slug: shiga-kogen-maruike
+  snowjapan_id: 463
+  region: nagano
+  hemisphere: north
+
+madarao:
+  lat: 36.8650
+  lon: 138.2200
+  elevation: 1382
+  snowjapan_slug: madarao-mountain-resort
+  snowjapan_id: 290
+  region: nagano
+  hemisphere: north
+
+akakura_kanko:
+  lat: 36.9990
+  lon: 138.1090
+  elevation: 1855
+  snowjapan_slug: akakura-kanko-resort
+  snowjapan_id: 15
+  region: niigata
+  hemisphere: north
+
+iwappara:
+  lat: 36.9470
+  lon: 138.8160
+  elevation: 1181
+  snowjapan_slug: iwappara
+  snowjapan_id: 203
+  region: niigata
+  hemisphere: north
