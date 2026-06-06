@@ -88,9 +88,9 @@ def run_nwp_direct(resort_id: str, cfg: dict,
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly, hemisphere=cfg.get("hemisphere", "north"))
 
-    snow_possible = daily["temp_min"] <= 2.0
-    # Prediction: 48h accumulation (includes yesterday) gated by temp
-    daily["japan_model_raw"] = daily["snowfall_48h"].clip(0) * snow_possible.values.astype(float)
+    # No gate here — calibration input must match forecast.py which now applies the
+    # physical gate AFTER calibration (iso_y[0] is non-zero, so gate must be last).
+    daily["japan_model_raw"] = daily["snowfall_48h"].clip(0)
     # Label: today's NWP snowfall (independent of the 48h window when used at t+1)
     daily["proxy_snow_cm"]   = daily["snowfall_24h"].clip(0)
 
@@ -117,10 +117,7 @@ def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
     _raw = model.predict(X)
     raw_preds = np.expm1(_raw).clip(0) if log_transform else _raw.clip(0)
 
-    # Physical gate
-    snow_possible = daily["temp_min"] <= 2.0
-    raw_preds = raw_preds * snow_possible.values.astype(float)
-
+    # No gate — must match forecast.py which gates AFTER calibration
     daily["japan_model_raw"] = raw_preds
     daily["proxy_snow_cm"]   = daily["snowfall_24h"].clip(0)
 

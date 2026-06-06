@@ -116,31 +116,28 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
     daily["lat"]         = cfg["lat"]
     daily["lon"]         = cfg["lon"]
 
-    preds = None
-
     # ── NWP-direct path (AU/NZ): use 48h NWP accumulation as the snowfall signal.
     # snowfall_24h is what we're predicting; snowfall_48h is the lead indicator
     # (includes yesterday's snowfall, which is known at forecast time).
     if calib and calib.get("nwp_direct"):
-        snow_possible = daily["temp_min"] <= 2.0
-        preds = daily["snowfall_48h"].clip(0).values * snow_possible.values.astype(float)
+        preds = daily["snowfall_48h"].clip(0).values
     else:
         # ── Japan model path (Japan + Andes resorts) ──────────────────────────
-        # Align to model feature columns, fill any missing with 0
         X = daily.reindex(columns=feat_cols, fill_value=0)
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         X.fillna(0, inplace=True)
-
         raw = model.predict(X)
         preds = np.expm1(raw).clip(0) if log_transform else raw.clip(0)
 
-        # Physical gate: no snow above freezing
-        snow_possible = daily["temp_min"] <= 2.0
-        preds = preds * snow_possible.values.astype(float)
-
-    # ── Transfer calibration (both paths) ────────────────────────────────────
+    # ── Transfer calibration ──────────────────────────────────────────────────
     if calib:
         preds = _apply_calibration(preds, calib)
+
+    # ── Physical gate: zero out predictions when too warm to snow ─────────────
+    # Applied AFTER calibration so the gate's zeros aren't remapped by the
+    # isotonic curve (iso_y[0] is non-zero, so calibrate(0) ≠ 0).
+    snow_possible = daily["temp_min"] <= 2.0
+    preds = preds * snow_possible.values.astype(float)
 
     results = []
     for i, (date_idx, row) in enumerate(daily.iterrows()):
