@@ -50,9 +50,9 @@ FEATURE_COLS = [
     # ── Moisture flux (wind × humidity) ───────────────────────────────────
     "moisture_flux_u", "moisture_flux_v",
     # ── Pressure ──────────────────────────────────────────────────────────
-    "pressure_mean", "pressure_min",
+    "pressure_mean",
     "pressure_tendency_24h", "pressure_tendency_3d", "pressure_anomaly",
-    # ── 850 hPa temperature (real data from 2021-03-23, imputed earlier) ────────
+    # ── 850 hPa temperature (real data from 2021-03-23, XGBoost NaN routing pre-2021)
     "temp_850_mean", "temp_850_min", "temp_850_max",
     "temp_850_trend", "rain_risk_850", "freeze_depth_850",
     # ── Dewpoint depression ────────────────────────────────────────────────
@@ -64,7 +64,7 @@ FEATURE_COLS = [
     "clear_sky_fraction", "freeze_thaw_event", "storm_duration_hours",
     # ── Rolling windows ────────────────────────────────────────────────────
     "snowfall_48h", "snowfall_72h", "snowfall_7d", "snowfall_14d",
-    "snowfall_last_30d", "freeze_thaw_count_7d", "seasonal_snowfall_total",
+    "snowfall_last_30d", "seasonal_snowfall_total",
     # ── Time-since features ────────────────────────────────────────────────
     "days_since_last_snow", "days_since_major_snow",
     # ── Ratio / index features ─────────────────────────────────────────────
@@ -72,13 +72,19 @@ FEATURE_COLS = [
     "wind_loading_index", "time_since_storm_peak",
     # ── Critical derived ───────────────────────────────────────────────────
     "snow_quality_index", "powder_freshness", "melt_risk", "wind_damage_score",
-    "has_base_snow", "intensity_ratio", "wind_after_storm", "temp_trend",
+    "wind_after_storm", "temp_trend",
     # ── Calendar ───────────────────────────────────────────────────────────
     "day_of_year", "month", "days_in_season",
-    # ── Snowpack state (observed) ──────────────────────────────────────────────
+    # ── Observed snow lags (actual new snow, not NWP) ─────────────────────
+    "overnight_snow_lag1",   # yesterday's actual new snow — multi-day storm signal
+    "overnight_snow_lag2",   # two days ago
+    "overnight_snow_3d_sum", # lag1 + lag2 observed accumulation
+    # ── Snowpack state (observed) ─────────────────────────────────────────
     "snow_depth_lag1",
-    # ── NWP bias correction (resort-level climatological ratio) ───────────────
+    # ── NWP bias correction ───────────────────────────────────────────────
     "nwp_amplification",
+    "amplified_snowfall_24h",  # snowfall_24h × nwp_amplification
+    "amplified_snowfall_48h",  # snowfall_48h × nwp_amplification
     # ── Static resort ──────────────────────────────────────────────────────
     "elevation", "lat", "lon", "region_code",
 ]
@@ -202,12 +208,12 @@ def train(
     # variance_power=1.2 (tuned): closer to Poisson than Gamma, which fits the
     # overnight snowfall distribution (many zeros, discrete-ish counts) better.
     model = XGBRegressor(
-        n_estimators          = 600,
-        max_depth             = 4,
+        n_estimators          = 800,
+        max_depth             = 5,
         learning_rate         = 0.04,
         subsample             = 0.8,
         colsample_bytree      = 0.8,
-        min_child_weight      = 5,
+        min_child_weight      = 7,
         reg_alpha             = 0.1,
         reg_lambda            = 1.0,
         objective             = "reg:tweedie",

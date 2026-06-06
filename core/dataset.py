@@ -121,18 +121,20 @@ def build(
         if n_missing > 0:
             print(f"  850hPa features: {n_missing:,} rows with NaN (pre-2021, handled by XGBoost)")
 
-    # ── Lagged snowpack depth ─────────────────────────────────────────────────
+    # ── Lagged snowpack depth + lagged actual new snow ────────────────────────
     df = df.sort_values(["resort_id", "date"]).reset_index(drop=True)
-    df["snow_depth_lag1"] = df.groupby("resort_id")["snow_depth_cm"].shift(1)
-    print(f"  Added snow_depth_lag1 ({df['snow_depth_lag1'].notna().sum():,} non-null)")
+    df["snow_depth_lag1"]       = df.groupby("resort_id")["snow_depth_cm"].shift(1)
+    df["overnight_snow_lag1"]   = df.groupby("resort_id")["overnight_snow_cm"].shift(1)
+    df["overnight_snow_lag2"]   = df.groupby("resort_id")["overnight_snow_cm"].shift(2)
+    df["overnight_snow_3d_sum"] = (
+        df["overnight_snow_lag1"].fillna(0) + df["overnight_snow_lag2"].fillna(0)
+    )
+    print(f"  Added snow lags (depth_lag1, overnight_lag1, overnight_lag2, 3d_sum)")
 
     # ── NWP amplification factor (per resort, computed from all available rows) ──
     # Open-Meteo NWP snowfall systematically underestimates orographic events,
     # especially in Hokkaido (observed up to 70cm vs NWP max ~20cm).
-    # This ratio (mean observed / mean NWP on snowy days) encodes that bias as a
-    # static feature so the model can rescale its expectations per resort.
-    # Computed from all rows (train+test) so it's a property of the resort, not the
-    # split — no leakage since it's a time-invariant climatological statistic.
+    # Time-invariant climatological property → not leakage.
     snowy = df[(df["overnight_snow_cm"] > 0) & (df["snowfall_24h"] > 0)].copy()
     amp   = (
         snowy.groupby("resort_id")
@@ -140,7 +142,13 @@ def build(
         .rename("nwp_amplification")
     )
     df["nwp_amplification"] = df["resort_id"].map(amp).fillna(1.0)
-    print(f"  Added nwp_amplification factor (per resort)")
+
+    # Explicit amplified snowfall features — multiplicative interactions that
+    # XGBoost won't reliably discover on its own from separate features.
+    df["amplified_snowfall_24h"] = df["snowfall_24h"] * df["nwp_amplification"]
+    df["amplified_snowfall_48h"] = df["snowfall_48h"] * df["nwp_amplification"]
+
+    print(f"  Added nwp_amplification + amplified_snowfall_24h/48h (per resort)")
     for rid, val in amp.sort_values(ascending=False).items():
         print(f"    {rid:<28} {val:.2f}x")
 

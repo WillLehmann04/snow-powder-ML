@@ -300,14 +300,17 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
 
     d["wind_damage_score"] = d["wind_during_snow_mean"] * d["snowfall_24h"]
 
-    # ── Snowpack state ────────────────────────────────────────────────────────
-    d["has_base_snow"] = (d["seasonal_snowfall_total"] > 5).astype(int)
+    # ── Cold air advection index ──────────────────────────────────────────────
+    # Captures Siberian cold air outbreak pattern: rising pressure + cold temps
+    # + NW wind off the Sea of Japan. Audit showed these conditions dominate the
+    # model's worst misses (actual >30cm but pred <20cm).
+    # Rising pressure × cold temp_min × NW wind component (negative u = from west)
+    pressure_rise = d["pressure_tendency_24h"].clip(lower=0)
+    cold_temp     = (-d["temp_min"]).clip(lower=0)
+    nw_wind       = (-d["wind_u_during_snow"]).clip(lower=0)
+    d["cold_air_advection"] = pressure_rise * cold_temp * nw_wind
 
     # ── Temporal / trend ──────────────────────────────────────────────────────
-    d["intensity_ratio"] = (
-        d["max_snowfall_1h"] / d["snowfall_24h"].replace(0, np.nan)
-    ).fillna(0)
-
     d["wind_after_storm"] = d["wind_mean"] * d["time_since_storm_peak"]
     d["temp_trend"]       = d["temp_mean"].diff().fillna(0)
 
