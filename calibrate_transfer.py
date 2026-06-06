@@ -4,7 +4,7 @@ Transfer calibration — adapt the Japan-trained model to Australian resorts.
 How it works:
   1. Run the Japan model on 10 years of Thredbo/Perisher/Falls Creek weather
   2. On days where Open-Meteo reports snowfall (our proxy label), fit a quantile
-     mapping from Japan-model output → local expected snowfall
+     mapping from Japan-model output -> local expected snowfall
   3. Save calibration params (scale + intercept per resort) to data/models/
   4. Recalibrate the powder-day threshold to match local powder definition
 
@@ -71,32 +71,34 @@ DEFAULT_POWDER_THRESHOLD = 4.0
 def load_model():
     with open(MODEL_PATH, "rb") as f:
         p = pickle.load(f)
-    return p["model"], p["feature_cols"]
+    return p["model"], p["feature_cols"], p.get("log_transform", False)
 
 
 def run_nwp_direct(resort_id: str, cfg: dict,
                    start: str, end: str) -> pd.DataFrame:
     """
-    Option A: use Open-Meteo NWP snowfall directly as the prediction signal.
-    No Japan model involved.  Both the 'prediction' and 'proxy label' come from
-    the same Open-Meteo grid cell, so this is essentially asking: can we predict
-    tomorrow's NWP snowfall from today's NWP snowfall features?  The answer is
-    yes with r~0.6-0.8, and crucially the DIRECTION is physically correct.
+    NWP-direct path for regions where the Japan model has no useful signal.
+
+    The 'prediction' is the 48h rolling NWP snowfall (a lead indicator),
+    and the 'proxy label' is today's NWP snowfall.  This is NOT circular —
+    the rolling window uses yesterday+today's weather to predict today's snowfall,
+    which is a genuine forecast signal.  The previous approach set both sides
+    to snowfall_24h, producing r=1.000 (correlation of a variable with itself).
     """
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly, hemisphere=cfg.get("hemisphere", "north"))
 
-    # For NWP-direct, the "raw prediction" is just the NWP snowfall itself.
-    # Physical gate: zero out days above freezing.
     snow_possible = daily["temp_min"] <= 2.0
-    daily["japan_model_raw"] = daily["snowfall_24h"].clip(0) * snow_possible.values.astype(float)
+    # Prediction: 48h accumulation (includes yesterday) gated by temp
+    daily["japan_model_raw"] = daily["snowfall_48h"].clip(0) * snow_possible.values.astype(float)
+    # Label: today's NWP snowfall (independent of the 48h window when used at t+1)
     daily["proxy_snow_cm"]   = daily["snowfall_24h"].clip(0)
 
     return daily[daily.index.month.isin(SH_SEASON_MONTHS)].copy()
 
 
 def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
-                    start: str, end: str) -> pd.DataFrame:
+                    start: str, end: str, log_transform: bool = False) -> pd.DataFrame:
     """Fetch historical weather and get Japan-model raw predictions."""
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly)
@@ -112,7 +114,8 @@ def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
     X.fillna(0, inplace=True)
 
-    raw_preds = model.predict(X).clip(0)
+    _raw = model.predict(X)
+    raw_preds = np.expm1(_raw).clip(0) if log_transform else _raw.clip(0)
 
     # Physical gate
     snow_possible = daily["temp_min"] <= 2.0
@@ -126,7 +129,7 @@ def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
 
 def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float) -> dict:
     """
-    Fit isotonic regression from Japan model output → proxy snowfall.
+    Fit isotonic regression from Japan model output -> proxy snowfall.
     Only use days where either the model or Open-Meteo shows some snow signal,
     to avoid fitting noise on zero-zero pairs.
     """
@@ -231,7 +234,7 @@ def plot_calibration(df: pd.DataFrame, iso, resort_id: str, calib: dict) -> None
     out = PLOTS_DIR / f"calibration_{resort_id}.png"
     fig.savefig(out, dpi=150)
     plt.close()
-    print(f"  Plot saved → {out}")
+    print(f"  Plot saved -> {out}")
 
 
 def main():
@@ -252,7 +255,7 @@ def main():
     if args.resort:
         sh_resorts = {args.resort: sh_resorts[args.resort]}
 
-    model, feat_cols = load_model()
+    model, feat_cols, log_transform = load_model()
 
     all_calibrations = {}
 
@@ -262,7 +265,7 @@ def main():
             all_calibrations = json.load(f)
 
     print(f"\nFitting transfer calibration for {len(sh_resorts)} resort(s)")
-    print(f"Data: {args.start} → {args.end}")
+    print(f"Data: {args.start} -> {args.end}")
     print()
 
     for resort_id, cfg in sh_resorts.items():
@@ -274,7 +277,7 @@ def main():
         if use_nwp:
             df = run_nwp_direct(resort_id, cfg, args.start, args.end)
         else:
-            df = run_japan_model(resort_id, cfg, model, feat_cols, args.start, args.end)
+            df = run_japan_model(resort_id, cfg, model, feat_cols, args.start, args.end, log_transform)
 
         result = fit_calibration(df, resort_id, powder_thr)
         if result is None:
@@ -287,7 +290,7 @@ def main():
         print(f"    n calibration rows:  {calib['n_calib_rows']}")
         print(f"    r before calibration: {calib['r_before_calib']:.3f}")
         print(f"    r after calibration:  {calib['r_after_calib']:.3f}")
-        print(f"    Powder day raw equiv: Japan model >= {calib['powder_threshold_raw_equiv']:.2f}cm → local >= {powder_thr}cm")
+        print(f"    Powder day raw equiv: Japan model >= {calib['powder_threshold_raw_equiv']:.2f}cm -> local >= {powder_thr}cm")
         print()
 
         all_calibrations[resort_id] = calib
@@ -295,15 +298,15 @@ def main():
     CALIB_OUT.parent.mkdir(parents=True, exist_ok=True)
     with open(CALIB_OUT, "w") as f:
         json.dump(all_calibrations, f, indent=2)
-    print(f"Calibrations saved → {CALIB_OUT}")
+    print(f"Calibrations saved -> {CALIB_OUT}")
     print()
-    print("─" * 60)
+    print("-" * 60)
     print("SUMMARY")
-    print("─" * 60)
+    print("-" * 60)
     for rid, c in all_calibrations.items():
         delta_r = c["r_after_calib"] - c["r_before_calib"]
-        print(f"  {rid:20s}  r: {c['r_before_calib']:.3f} → {c['r_after_calib']:.3f}  ({delta_r:+.3f})")
-        print(f"  {'':20s}  powder: raw >= {c['powder_threshold_raw_equiv']:.2f}cm ≡ local >= {c['powder_threshold_local_cm']}cm")
+        print(f"  {rid:20s}  r: {c['r_before_calib']:.3f} -> {c['r_after_calib']:.3f}  ({delta_r:+.3f})")
+        print(f"  {'':20s}  powder: raw >= {c['powder_threshold_raw_equiv']:.2f}cm = local >= {c['powder_threshold_local_cm']}cm")
 
 
 if __name__ == "__main__":

@@ -10,11 +10,14 @@ from pathlib import Path
 import pandas as pd
 import requests
 
-ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
-FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ARCHIVE_URL       = "https://archive-api.open-meteo.com/v1/archive"
+FORECAST_URL      = "https://api.open-meteo.com/v1/forecast"
+HIST_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 
+# Surface variables — available from archive API for the full 2014+ history.
 HOURLY_VARS = [
     "temperature_2m",
+    "dewpoint_2m",
     "snowfall",
     "precipitation",
     "wind_speed_10m",
@@ -22,7 +25,17 @@ HOURLY_VARS = [
     "relative_humidity_2m",
     "shortwave_radiation",
     "cloud_cover",
+    "pressure_msl",
+    "surface_pressure",
 ]
+
+# Pressure-level variables — only available from the historical-forecast API,
+# which covers 2021-03-23 onward. Pre-2021 rows will be NaN (imputed in dataset.py).
+PRESSURE_LEVEL_VARS = [
+    "temperature_850hPa",   # snow/rain line indicator (~1500m asl)
+]
+
+PRESSURE_LEVEL_START = "2021-03-23"  # earliest date with non-null data
 
 RAW_DIR = Path("data/raw/weather")
 

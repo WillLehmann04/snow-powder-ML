@@ -1,16 +1,58 @@
 """
 Daily feature engineering from hourly Open-Meteo data.
-All rolling windows use season_year (not calendar year) so Northern Hemisphere
-winters that cross Jan 1 are handled correctly.
+
+New vs original:
+  - Wind direction: decomposed to u/v components (circular mean), plus
+    mean vector direction during snowfall hours and directional consistency.
+    Raw degrees are useless (359deg and 1deg average to 180deg, not 0deg).
+  - Pressure: mean sea-level pressure, 24h tendency (falling = incoming storm),
+    and minimum daily pressure (deep lows = heavy snow events).
+  - Dewpoint depression (temp - dewpoint): low depression = air near saturation
+    = precipitation likely. High depression = dry air = no snow even if cold.
+  - Pressure tendency rolling: how fast pressure has been falling over 3 days.
+  - Season-year rollup is hemisphere-aware (NH: Oct, SH: Apr).
 """
 
 import numpy as np
 import pandas as pd
 
 
-def _season_year(dt) -> int:
-    """Return the year the ski season started: Oct-Dec → that year, Jan-Sep → year-1."""
+def _season_year_north(dt) -> int:
+    """NH: Oct-Dec -> that year, Jan-Sep -> year-1."""
     return dt.year if dt.month >= 10 else dt.year - 1
+
+
+def _season_year_south(dt) -> int:
+    """SH: Apr-Dec -> that year, Jan-Mar -> year-1."""
+    return dt.year if dt.month >= 4 else dt.year - 1
+
+
+def _season_year(dt) -> int:
+    """Legacy alias — northern hemisphere."""
+    return _season_year_north(dt)
+
+
+def _vector_mean_direction(directions_deg: pd.Series) -> float:
+    """Circular mean of wind directions. Returns degrees [0, 360)."""
+    rad = np.deg2rad(directions_deg.dropna())
+    if len(rad) == 0:
+        return np.nan
+    u = np.sin(rad).mean()
+    v = np.cos(rad).mean()
+    deg = np.rad2deg(np.arctan2(u, v)) % 360
+    return float(deg)
+
+
+def _directional_consistency(directions_deg: pd.Series) -> float:
+    """
+    Ratio of vector-mean wind speed to scalar-mean wind speed.
+    1.0 = all wind from same direction. 0.0 = random / cancelling directions.
+    """
+    rad = np.deg2rad(directions_deg.dropna())
+    if len(rad) == 0:
+        return np.nan
+    r = np.sqrt(np.sin(rad).mean() ** 2 + np.cos(rad).mean() ** 2)
+    return float(r)
 
 
 def _agg_daily(hourly: pd.DataFrame) -> pd.DataFrame:
@@ -19,7 +61,16 @@ def _agg_daily(hourly: pd.DataFrame) -> pd.DataFrame:
     h["date"]    = h.index.normalize()
     h["is_snow"] = h["snowfall"] > 0
 
-    base = h.groupby("date").agg(
+    # ── Wind u/v components (handle circular nature of direction) ─────────────
+    if "wind_direction_10m" in h.columns:
+        dir_rad = np.deg2rad(h["wind_direction_10m"].fillna(0))
+        h["wind_u"] = h["wind_speed_10m"] * np.sin(dir_rad)   # eastward
+        h["wind_v"] = h["wind_speed_10m"] * np.cos(dir_rad)   # northward
+    else:
+        h["wind_u"] = 0.0
+        h["wind_v"] = 0.0
+
+    agg_dict = dict(
         snowfall_24h         =("snowfall",             "sum"),
         precipitation        =("precipitation",        "sum"),
         hours_with_snow      =("is_snow",              "sum"),
@@ -29,27 +80,67 @@ def _agg_daily(hourly: pd.DataFrame) -> pd.DataFrame:
         temp_mean            =("temperature_2m",       "mean"),
         wind_max             =("wind_speed_10m",       "max"),
         wind_mean            =("wind_speed_10m",       "mean"),
+        wind_u_mean          =("wind_u",               "mean"),
+        wind_v_mean          =("wind_v",               "mean"),
         humidity_mean        =("relative_humidity_2m", "mean"),
         radiation_mean       =("shortwave_radiation",  "mean"),
         radiation_peak       =("shortwave_radiation",  "max"),
         cloud_cover_mean     =("cloud_cover",          "mean"),
     )
 
-    # Snow-conditional aggregates — 0 (not NaN) on no-snow days
+    if "pressure_msl" in h.columns:
+        agg_dict["pressure_mean"] = ("pressure_msl", "mean")
+        agg_dict["pressure_min"]  = ("pressure_msl", "min")
+
+    if "dewpoint_2m" in h.columns:
+        agg_dict["dewpoint_mean"] = ("dewpoint_2m", "mean")
+        agg_dict["dewpoint_min"]  = ("dewpoint_2m", "min")
+
+    if "temperature_850hPa" in h.columns:
+        agg_dict["temp_850_mean"] = ("temperature_850hPa", "mean")
+        agg_dict["temp_850_min"]  = ("temperature_850hPa", "min")
+        agg_dict["temp_850_max"]  = ("temperature_850hPa", "max")
+
+    base = h.groupby("date").agg(**agg_dict)
+
+    # ── Wind direction features (need apply, can't go in agg dict) ────────────
+    if "wind_direction_10m" in h.columns:
+        base["wind_dir_mean"] = h.groupby("date")["wind_direction_10m"].apply(
+            _vector_mean_direction
+        )
+        base["wind_dir_consistency"] = h.groupby("date")["wind_direction_10m"].apply(
+            _directional_consistency
+        )
+    else:
+        base["wind_dir_mean"] = np.nan
+        base["wind_dir_consistency"] = np.nan
+
+    # ── Snow-conditional aggregates ───────────────────────────────────────────
     snow_only = h[h["is_snow"]]
     if not snow_only.empty:
-        cond = snow_only.groupby("date").agg(
+        snow_agg = dict(
             snow_temp_mean        =("temperature_2m",       "mean"),
             wind_during_snow_mean =("wind_speed_10m",       "mean"),
             wind_during_snow_max  =("wind_speed_10m",       "max"),
             humidity_during_snow  =("relative_humidity_2m", "mean"),
+            wind_u_during_snow    =("wind_u",               "mean"),
+            wind_v_during_snow    =("wind_v",               "mean"),
         )
+        cond = snow_only.groupby("date").agg(**snow_agg)
         base = base.join(cond)
 
+        if "wind_direction_10m" in snow_only.columns:
+            base["wind_dir_during_snow"] = snow_only.groupby("date")["wind_direction_10m"].apply(
+                _vector_mean_direction
+            )
+
     snow_cond_cols = [
-        "snow_temp_mean", "wind_during_snow_mean",
-        "wind_during_snow_max", "humidity_during_snow",
+        "snow_temp_mean", "wind_during_snow_mean", "wind_during_snow_max",
+        "humidity_during_snow", "wind_u_during_snow", "wind_v_during_snow",
     ]
+    if "wind_dir_during_snow" not in base.columns:
+        base["wind_dir_during_snow"] = np.nan
+
     for col in snow_cond_cols:
         if col not in base.columns:
             base[col] = 0.0
@@ -81,12 +172,12 @@ def _agg_daily(hourly: pd.DataFrame) -> pd.DataFrame:
     return base
 
 
-def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
+def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFrame:
     """
-    Compute all Tier 1-4 and critical derived features on top of daily aggregates.
-    Input: hourly DataFrame from Open-Meteo (indexed by datetime).
-    Output: daily DataFrame with ~40 engineered features.
+    Compute all features on top of daily aggregates.
+    hemisphere: "north" (default) or "south" — controls season-year rollup.
     """
+    _sy = _season_year_south if hemisphere == "south" else _season_year_north
     d = _agg_daily(hourly)
 
     # ── Rolling snow windows ───────────────────────────────────────────────────
@@ -99,15 +190,70 @@ def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
     # ── Freeze-thaw rolling ────────────────────────────────────────────────────
     d["freeze_thaw_count_7d"] = d["freeze_thaw_event"].rolling(7, min_periods=1).sum()
 
-    # ── Seasonal cumulative (resets at season start, Oct 1 for N. hemisphere) ──
-    # Uses season_year so the window never crosses a calendar year boundary.
-    d["_season_year"] = d.index.map(_season_year)
-    d["seasonal_snowfall_total"] = (
-        d.groupby("_season_year")["snowfall_24h"].cumsum()
-    )
+    # ── Seasonal cumulative ────────────────────────────────────────────────────
+    d["_season_year"] = d.index.map(_sy)
+    d["seasonal_snowfall_total"] = d.groupby("_season_year")["snowfall_24h"].cumsum()
     d.drop(columns=["_season_year"], inplace=True)
 
-    # ── Days since last snow / major snow (>= 10 cm) ──────────────────────────
+    # ── Pressure features ─────────────────────────────────────────────────────
+    if "pressure_mean" in d.columns:
+        # 24h tendency: falling pressure = incoming storm (most important sign)
+        d["pressure_tendency_24h"] = d["pressure_mean"].diff(1).fillna(0)
+        # 3-day tendency: sustained pattern
+        d["pressure_tendency_3d"]  = d["pressure_mean"].diff(3).fillna(0)
+        # Anomaly from 7-day rolling mean: deviations from local baseline
+        d["pressure_anomaly"]      = d["pressure_mean"] - d["pressure_mean"].rolling(7, min_periods=1).mean()
+    else:
+        d["pressure_tendency_24h"] = 0.0
+        d["pressure_tendency_3d"]  = 0.0
+        d["pressure_anomaly"]      = 0.0
+
+    # ── 850 hPa temperature ───────────────────────────────────────────────────
+    # 850hPa sits at ~1500m asl — close to most resort summit elevations.
+    # When temp_850 > 0°C, precipitation is likely rain not snow at resort level.
+    # The trend (how fast it's cooling/warming aloft) is a better storm indicator
+    # than surface temp because it's unaffected by local terrain effects.
+    if "temp_850_mean" in d.columns:
+        d["temp_850_trend"]   = d["temp_850_mean"].diff(1).fillna(0)
+        d["rain_risk_850"]    = d["temp_850_mean"].clip(-20, 10) / 10
+        d["freeze_depth_850"] = (-d["temp_850_mean"]).clip(0)
+    else:
+        # Use NaN, not 0. 0°C at 850hPa is a real weather condition (marginal
+        # snow level); NaN signals genuinely missing data and gets imputed with
+        # monthly means in core/dataset.py before training.
+        d["temp_850_mean"]    = np.nan
+        d["temp_850_min"]     = np.nan
+        d["temp_850_max"]     = np.nan
+        d["temp_850_trend"]   = np.nan
+        d["rain_risk_850"]    = np.nan
+        d["freeze_depth_850"] = np.nan
+
+    # ── Dewpoint depression ───────────────────────────────────────────────────
+    if "dewpoint_mean" in d.columns:
+        # Low depression (temp near dewpoint) = air near saturation = snow likely
+        d["dewpoint_depression"] = d["temp_mean"] - d["dewpoint_mean"]
+        d["dewpoint_depression_min"] = d["temp_min"] - d["dewpoint_min"]
+    else:
+        d["dewpoint_depression"]     = np.nan
+        d["dewpoint_depression_min"] = np.nan
+
+    # ── Wind direction features ───────────────────────────────────────────────
+    # Wind direction sin/cos encode the circular feature for tree models
+    if "wind_dir_mean" in d.columns and d["wind_dir_mean"].notna().any():
+        d["wind_dir_sin"] = np.sin(np.deg2rad(d["wind_dir_mean"].fillna(0)))
+        d["wind_dir_cos"] = np.cos(np.deg2rad(d["wind_dir_mean"].fillna(0)))
+        # Same during snowfall hours — the directionally important signal
+        d["wind_dir_snow_sin"] = np.sin(np.deg2rad(d["wind_dir_during_snow"].fillna(0)))
+        d["wind_dir_snow_cos"] = np.cos(np.deg2rad(d["wind_dir_during_snow"].fillna(0)))
+    else:
+        d["wind_dir_sin"] = d["wind_dir_cos"] = 0.0
+        d["wind_dir_snow_sin"] = d["wind_dir_snow_cos"] = 0.0
+
+    # Moisture flux: u/v wind * humidity — directional moisture transport
+    d["moisture_flux_u"] = d["wind_u_mean"] * d["humidity_mean"] / 100
+    d["moisture_flux_v"] = d["wind_v_mean"] * d["humidity_mean"] / 100
+
+    # ── Days since last / major snow ──────────────────────────────────────────
     snow_idx  = d.index[d["snowfall_24h"] > 0]
     major_idx = d.index[d["snowfall_24h"] >= 10]
 
@@ -118,14 +264,14 @@ def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
     d["days_since_last_snow"]  = [_days_since(snow_idx,  dt) for dt in d.index]
     d["days_since_major_snow"] = [_days_since(major_idx, dt) for dt in d.index]
 
-    # ── Snowfall decay ratios ──────────────────────────────────────────────────
+    # ── Snowfall ratios ───────────────────────────────────────────────────────
     d["snowfall_ratio_1d_3d"] = d["snowfall_24h"] / d["snowfall_72h"].replace(0, np.nan)
     d["snowfall_ratio_3d_7d"] = d["snowfall_72h"] / d["snowfall_7d"].replace(0, np.nan)
 
-    # ── Wind loading index (capped) ────────────────────────────────────────────
+    # ── Wind loading (capped) ─────────────────────────────────────────────────
     d["wind_loading_index"] = (d["wind_max"] * d["snowfall_24h"]).clip(upper=100)
 
-    # ── Time since storm peak (trailing 7-day window) ─────────────────────────
+    # ── Time since storm peak ─────────────────────────────────────────────────
     tsp = []
     for i, dt in enumerate(d.index):
         window = d.iloc[max(0, i - 6): i + 1]["snowfall_24h"]
@@ -134,7 +280,7 @@ def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
 
     d["radiation_peak"] = d["radiation_peak"].clip(upper=600)
 
-    # ── Critical derived features ──────────────────────────────────────────────
+    # ── Critical derived features ─────────────────────────────────────────────
     temp_norm = ((d["snow_temp_mean"] - (-30)) / (10 - (-30))).clip(0, 1)
     wind_norm = (d["wind_during_snow_mean"] / 80).clip(0, 1)
 
@@ -154,10 +300,10 @@ def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
 
     d["wind_damage_score"] = d["wind_during_snow_mean"] * d["snowfall_24h"]
 
-    # ── Snowpack state ─────────────────────────────────────────────────────────
+    # ── Snowpack state ────────────────────────────────────────────────────────
     d["has_base_snow"] = (d["seasonal_snowfall_total"] > 5).astype(int)
 
-    # ── Temporal / trend features ──────────────────────────────────────────────
+    # ── Temporal / trend ──────────────────────────────────────────────────────
     d["intensity_ratio"] = (
         d["max_snowfall_1h"] / d["snowfall_24h"].replace(0, np.nan)
     ).fillna(0)
@@ -165,12 +311,10 @@ def build_features(hourly: pd.DataFrame) -> pd.DataFrame:
     d["wind_after_storm"] = d["wind_mean"] * d["time_since_storm_peak"]
     d["temp_trend"]       = d["temp_mean"].diff().fillna(0)
 
-    # ── Calendar features ──────────────────────────────────────────────────────
-    d["day_of_year"]   = d.index.day_of_year
-    d["month"]         = d.index.month
-    d["season_year"]   = d.index.map(_season_year)
-    d["days_in_season"] = (
-        d.groupby("season_year").cumcount()
-    )
+    # ── Calendar ──────────────────────────────────────────────────────────────
+    d["day_of_year"]    = d.index.day_of_year
+    d["month"]          = d.index.month
+    d["season_year"]    = d.index.map(_sy)
+    d["days_in_season"] = d.groupby("season_year").cumcount()
 
     return d

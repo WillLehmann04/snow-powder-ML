@@ -172,3 +172,106 @@ iwappara:
   snowjapan_id: 203
   region: niigata
   hemisphere: north
+
+# ── Australia ─────────────────────────────────────────────────────────────────
+# Forecast uses NWP-direct path (Open-Meteo snowfall + temp gate).
+# Independent labels: resort_snapshot.py collects daily reports once live URLs
+# are configured below. Until then the model has no SH training data.
+thredbo:
+  lat: -36.5054
+  lon: 148.3009
+  elevation: 2037
+  region: nsw
+  hemisphere: south
+  snow_report_url: https://www.thredbo.com.au/mountain-information/snow-report/
+  snow_report_format: livepass_xml
+
+perisher:
+  lat: -36.4072
+  lon: 148.4068
+  elevation: 2054
+  region: nsw
+  hemisphere: south
+  snow_report_url: https://www.perisher.com.au/mountain-information/snow-report/
+  snow_report_format: livepass_xml
+
+falls_creek:
+  lat: -36.8677
+  lon: 147.2757
+  elevation: 1780
+  region: victoria
+  hemisphere: south
+  snow_report_url: https://www.fallscreek.com.au/mountain-information/snow-report/
+  snow_report_format: livepass_xml
+
+# ── New Zealand ───────────────────────────────────────────────────────────────
+cardrona:
+  lat: -44.8780
+  lon: 168.9990
+  elevation: 1894
+  region: nz_south
+  hemisphere: south
+
+treble_cone:
+  lat: -44.6270
+  lon: 168.9030
+  elevation: 1950
+  region: nz_south
+  hemisphere: south
+
+mt_hutt:
+  lat: -43.4980
+  lon: 171.4990
+  elevation: 2086
+  region: nz_south
+  hemisphere: south
+
+coronet_peak:
+  lat: -45.0610
+  lon: 168.7380
+  elevation: 1651
+  region: nz_south
+  hemisphere: south
+
+the_remarkables:
+  lat: -45.0320
+  lon: 168.8340
+  elevation: 1945
+  region: nz_south
+  hemisphere: south
+
+whakapapa:
+  lat: -39.2340
+  lon: 175.5630
+  elevation: 2020
+  region: nz_north
+  hemisphere: south
+
+# ── South America ─────────────────────────────────────────────────────────────
+valle_nevado:
+  lat: -33.3580
+  lon: -70.0740
+  elevation: 3670
+  region: andes_chile
+  hemisphere: south
+
+portillo:
+  lat: -32.8360
+  lon: -70.1350
+  elevation: 2880
+  region: andes_chile
+  hemisphere: south
+
+las_lenas:
+  lat: -35.1530
+  lon: -70.0670
+  elevation: 3430
+  region: andes_argentina
+  hemisphere: south
+
+catedral_bariloche:
+  lat: -41.1680
+  lon: -71.4430
+  elevation: 1934
+  region: andes_argentina
+  hemisphere: south

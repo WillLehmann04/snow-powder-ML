@@ -42,11 +42,11 @@ REGION_MAP       = {"hokkaido": 0, "nagano": 1, "niigata": 2, "tohoku": 3,
 def load_model():
     with open(MODEL_PATH, "rb") as f:
         p = pickle.load(f)
-    return p["model"], p["feature_cols"]
+    return p["model"], p["feature_cols"], p.get("log_transform", False)
 
 
 def forecast_resort_historical(resort_id: str, cfg: dict, model, feat_cols: list,
-                                start: str, end: str) -> pd.DataFrame:
+                                start: str, end: str, log_transform: bool = False) -> pd.DataFrame:
     """Fetch historical weather, run model, return daily DataFrame."""
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly)
@@ -62,7 +62,8 @@ def forecast_resort_historical(resort_id: str, cfg: dict, model, feat_cols: list
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
     X.fillna(0, inplace=True)
 
-    preds = model.predict(X).clip(0)
+    raw = model.predict(X)
+    preds = np.expm1(raw).clip(0) if log_transform else raw.clip(0)
 
     # Physical gate: no snow if temp_min > 2C
     snow_possible = daily["temp_min"] <= 2.0
@@ -159,7 +160,7 @@ def main():
             return
         sh_resorts = {args.resort: sh_resorts[args.resort]}
 
-    model, feat_cols = load_model()
+    model, feat_cols, log_transform = load_model()
 
     # Build date range covering requested seasons
     # Southern hemisphere: season is Jun–Sep, so season 2023 = Jun–Sep 2023
@@ -176,7 +177,7 @@ def main():
     results = []
     for resort_id, cfg in sh_resorts.items():
         print(f"  Processing {resort_id} …")
-        df = forecast_resort_historical(resort_id, cfg, model, feat_cols, start, end)
+        df = forecast_resort_historical(resort_id, cfg, model, feat_cols, start, end, log_transform)
         plot_season(df, resort_id)
         result = evaluate(df, resort_id)
         results.append(result)

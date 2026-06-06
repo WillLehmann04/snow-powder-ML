@@ -68,7 +68,7 @@ def load_model():
         sys.exit(f"Model not found at {MODEL_PATH}. Run: python -m core.train")
     with open(MODEL_PATH, "rb") as f:
         payload = pickle.load(f)
-    return payload["model"], payload["feature_cols"]
+    return payload["model"], payload["feature_cols"], payload.get("log_transform", False)
 
 
 def load_calibrations() -> dict:
@@ -87,7 +87,8 @@ def _apply_calibration(raw_preds: np.ndarray, calib: dict) -> np.ndarray:
 
 
 def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
-                    calibrations: dict, days: int = 7) -> list[dict]:
+                    calibrations: dict, days: int = 7,
+                    log_transform: bool = False) -> list[dict]:
     """Fetch forecast, run model, return list of daily dicts."""
     from datetime import date, timedelta
     today = date.today()
@@ -117,12 +118,12 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
 
     preds = None
 
-    # ── NWP-direct path (AU/NZ): skip Japan model, use Open-Meteo snowfall ────
-    # For regions where the Japan model has no useful signal, the NWP snowfall
-    # column is a far better predictor (r~0.6-0.8 vs r~0.1-0.3).
+    # ── NWP-direct path (AU/NZ): use 48h NWP accumulation as the snowfall signal.
+    # snowfall_24h is what we're predicting; snowfall_48h is the lead indicator
+    # (includes yesterday's snowfall, which is known at forecast time).
     if calib and calib.get("nwp_direct"):
         snow_possible = daily["temp_min"] <= 2.0
-        preds = daily["snowfall_24h"].clip(0).values * snow_possible.values.astype(float)
+        preds = daily["snowfall_48h"].clip(0).values * snow_possible.values.astype(float)
     else:
         # ── Japan model path (Japan + Andes resorts) ──────────────────────────
         # Align to model feature columns, fill any missing with 0
@@ -130,7 +131,8 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         X.fillna(0, inplace=True)
 
-        preds = model.predict(X).clip(0)
+        raw = model.predict(X)
+        preds = np.expm1(raw).clip(0) if log_transform else raw.clip(0)
 
         # Physical gate: no snow above freezing
         snow_possible = daily["temp_min"] <= 2.0
@@ -178,16 +180,17 @@ def render_resort(resort_id: str, days: list[dict]) -> None:
     powder_days = [d for d in days if d["is_powder_day"]]
     best        = max(days, key=lambda d: d["powder_score"])
 
-    print(f"\n{'─' * 62}")
+    sep = "-" * 62
+    print(f"\n{sep}")
     print(f"  {resort_label}")
-    print(f"{'─' * 62}")
-    print(f"  {'Date':<12} {'Snow':>6} {'Score':>6}  {'Temp':>10}  {'Wind':>10}  Conditions")
-    print(f"  {'':─<12} {'':─<6} {'':─<6}  {'':─<10}  {'':─<10}  {'':─<12}")
+    print(f"{sep}")
+    print(f"  {'Date':<12} {'Snow':>6} {'Score':>6}  {'Temp':>14}  {'Wind':>10}  Conditions")
+    print(f"  {'':-<12} {'':->6} {'':->6}  {'':->14}  {'':->10}  {'':->12}")
 
     for d in days:
         snow  = f"{d['predicted_snow_cm']}cm"
         score = f"{d['powder_score']}/100"
-        temp  = f"{d['temp_min_c']}→{d['temp_max_c']}°C"
+        temp  = f"{d['temp_min_c']} to {d['temp_max_c']}C"
         wind  = f"{d['wind_mean_kmh']}kmh"
         tag   = "*** POWDER ***" if d["is_powder_day"] else ""
         print(f"  {d['date']:<12} {snow:>6} {score:>6}  {temp:>10}  {wind:>10}  {tag}")
@@ -218,15 +221,18 @@ def main():
     else:
         targets = regions
 
-    model, feat_cols = load_model()
+    model, feat_cols, log_transform = load_model()
     calibrations = load_calibrations()
     if calibrations:
         print(f"  Loaded transfer calibration for: {', '.join(calibrations)}")
 
     all_results = {}
     for resort_id, cfg in targets.items():
-        print(f"  Fetching forecast for {resort_id} …", end="\r")
-        all_results[resort_id] = forecast_resort(resort_id, cfg, model, feat_cols, calibrations, days=args.days)
+        print(f"  Fetching forecast for {resort_id} ...", end="\r")
+        all_results[resort_id] = forecast_resort(
+            resort_id, cfg, model, feat_cols, calibrations,
+            days=args.days, log_transform=log_transform,
+        )
 
     if args.json:
         print(json.dumps(all_results, indent=2))
@@ -255,7 +261,7 @@ def main():
     unique_thr = sorted(set(thresholds.values()))
     for thr in unique_thr:
         resorts = [r for r, t in thresholds.items() if t == thr]
-        print(f"  Powder threshold ≥{thr}cm: {', '.join(r.replace('_',' ') for r in resorts)}")
+        print(f"  Powder threshold >={thr}cm: {', '.join(r.replace('_',' ') for r in resorts)}")
     print("=" * 62 + "\n")
 
 
