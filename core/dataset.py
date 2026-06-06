@@ -1,17 +1,16 @@
 """
-Build the training dataset by joining SnowJapan labels with Open-Meteo features.
+Build the training dataset from Japan (SnowJapan) + SH (ERA5 snow_depth) labels.
 
 Steps:
-  1. Load snowjapan_labels.csv (date, resort_id, season, snow_depth_cm, new_snow_cm)
-  2. Load per-resort feature CSVs from data/processed/features_{resort_id}.csv
-  3. Merge on (resort_id, date)
-  4. Add static resort features from regions.yaml (elevation, lat, lon, region, region_code)
-  5. Clean labels: drop physically implausible overnight snowfall values
+  1. Load snowjapan_labels.csv  -- Japan observed new snow (SnowJapan API)
+  2. Load sh_labels.csv         -- SH ERA5 snow_depth-change labels (build_sh_labels.py)
+  3. Concatenate, load per-resort feature CSVs, merge on (resort_id, date)
+  4. Add static resort features from regions.yaml
+  5. Compute per-resort NWP amplification factors
   6. Save to data/processed/training_dataset.parquet
 
 Usage:
   python -m core.dataset
-  python -m core.dataset --labels data/processed/snowjapan_labels.csv
 """
 
 import argparse
@@ -21,10 +20,11 @@ import numpy as np
 import pandas as pd
 import yaml
 
-LABELS_PATH   = Path("data/processed/snowjapan_labels.csv")
-FEATURES_DIR  = Path("data/processed")
-REGIONS_YAML  = Path("regions.yaml")
-OUTPUT_PATH   = Path("data/processed/training_dataset.parquet")
+LABELS_PATH    = Path("data/processed/snowjapan_labels.csv")
+SH_LABELS_PATH = Path("data/processed/sh_labels.csv")
+FEATURES_DIR   = Path("data/processed")
+REGIONS_YAML   = Path("regions.yaml")
+OUTPUT_PATH    = Path("data/processed/training_dataset.parquet")
 
 REGION_MAP = {
     "hokkaido":        0,
@@ -51,17 +51,29 @@ def load_regions(path: Path = REGIONS_YAML) -> dict:
 
 
 def build(
-    labels_path: Path = LABELS_PATH,
-    features_dir: Path = FEATURES_DIR,
-    output_path: Path = OUTPUT_PATH,
-    label_cap: float = LABEL_CAP_CM,
+    labels_path:    Path = LABELS_PATH,
+    sh_labels_path: Path = SH_LABELS_PATH,
+    features_dir:   Path = FEATURES_DIR,
+    output_path:    Path = OUTPUT_PATH,
+    label_cap:      float = LABEL_CAP_CM,
 ) -> pd.DataFrame:
 
+    # ── Load Japan labels (SnowJapan observed) ────────────────────────────────
     print("Loading labels ...")
     labels = pd.read_csv(labels_path, parse_dates=["date"])
-    # Rename to canonical target column name
     labels = labels.rename(columns={"new_snow_cm": "overnight_snow_cm"})
-    print(f"  {len(labels):,} label rows, {labels['resort_id'].nunique()} resorts")
+    print(f"  Japan:  {len(labels):,} rows, {labels['resort_id'].nunique()} resorts")
+
+    # ── Load SH labels (ERA5 snow_depth change) ───────────────────────────────
+    if sh_labels_path.exists():
+        sh = pd.read_csv(sh_labels_path, parse_dates=["date"])
+        sh = sh.rename(columns={"new_snow_cm": "overnight_snow_cm"})
+        print(f"  SH:     {len(sh):,} rows, {sh['resort_id'].nunique()} resorts")
+        labels = pd.concat([labels, sh], ignore_index=True)
+    else:
+        print("  SH labels not found — run build_sh_labels.py to add SH resorts")
+
+    print(f"  Total:  {len(labels):,} label rows, {labels['resort_id'].nunique()} resorts")
 
     # ── Clean labels ──────────────────────────────────────────────────────────
     before = len(labels)
@@ -152,6 +164,7 @@ def build(
     for rid, val in amp.sort_values(ascending=False).items():
         print(f"    {rid:<28} {val:.2f}x")
 
+
     # Sort
     df = df.sort_values(["resort_id", "date"]).reset_index(drop=True)
 
@@ -174,12 +187,16 @@ def build(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--labels",  default=str(LABELS_PATH))
-    parser.add_argument("--output",  default=str(OUTPUT_PATH))
-    parser.add_argument("--cap",     type=float, default=LABEL_CAP_CM,
-                        help=f"Drop rows with overnight_snow_cm above this (default {LABEL_CAP_CM})")
+    parser.add_argument("--labels",    default=str(LABELS_PATH))
+    parser.add_argument("--sh-labels", default=str(SH_LABELS_PATH))
+    parser.add_argument("--output",    default=str(OUTPUT_PATH))
+    parser.add_argument("--cap",       type=float, default=LABEL_CAP_CM,
+                        help=f"Drop rows above this cm (default {LABEL_CAP_CM})")
+    parser.add_argument("--no-sh",     action="store_true",
+                        help="Skip SH labels (Japan-only dataset)")
     args = parser.parse_args()
-    build(Path(args.labels), FEATURES_DIR, Path(args.output), args.cap)
+    sh_path = Path("__no_sh__") if args.no_sh else Path(args.sh_labels)
+    build(Path(args.labels), sh_path, FEATURES_DIR, Path(args.output), args.cap)
 
 
 if __name__ == "__main__":

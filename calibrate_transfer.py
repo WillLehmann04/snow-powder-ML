@@ -40,7 +40,11 @@ REGIONS_YAML = Path("regions.yaml")
 PLOTS_DIR    = Path("data/plots")
 
 SH_SEASON_MONTHS = {6, 7, 8, 9}
-REGION_MAP = {"hokkaido": 0, "nagano": 1, "niigata": 2, "tohoku": 3, "nsw": 4, "victoria": 5}
+REGION_MAP = {
+    "hokkaido": 0, "nagano": 1, "niigata": 2, "tohoku": 3,
+    "nsw": 4, "victoria": 5, "nz_south": 6, "nz_north": 7,
+    "andes_chile": 8, "andes_argentina": 9,
+}
 
 # Regions where the Japan model has usable signal (r ≥ ~0.3 before calibration).
 # All other SH regions use NWP snowfall directly (Option A).
@@ -97,18 +101,45 @@ def run_nwp_direct(resort_id: str, cfg: dict,
     return daily[daily.index.month.isin(SH_SEASON_MONTHS)].copy()
 
 
+SH_LABELS_PATH = Path("data/processed/sh_labels.csv")
+
+
 def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
                     start: str, end: str, log_transform: bool = False) -> pd.DataFrame:
     """Fetch historical weather and get Japan-model raw predictions."""
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
-    daily  = build_features(hourly)
+    daily  = build_features(hourly, hemisphere="south")
 
     daily["resort_id"]   = resort_id
     daily["elevation"]   = cfg["elevation"]
     daily["region"]      = cfg["region"]
-    daily["region_code"] = REGION_MAP.get(cfg["region"], 4)
+    daily["region_code"] = REGION_MAP.get(cfg["region"], -1)
     daily["lat"]         = cfg["lat"]
     daily["lon"]         = cfg["lon"]
+
+    # ERA5 labels: better proxy than NWP snowfall (same label type as training),
+    # and needed to compute nwp_amplification correctly.
+    if SH_LABELS_PATH.exists():
+        sh_lab = pd.read_csv(SH_LABELS_PATH, parse_dates=["date"])
+        sh_lab = sh_lab[sh_lab["resort_id"] == resort_id].copy()
+        sh_lab["date"] = sh_lab["date"].dt.normalize()
+
+        # Compute per-resort NWP amplification from ERA5/NWP ratio (same as dataset.py)
+        daily_idx = daily.reset_index().rename(columns={"index": "date"})
+        daily_idx["date"] = pd.to_datetime(daily_idx["date"]).dt.normalize()
+        merged_amp = daily_idx.merge(sh_lab[["date", "new_snow_cm"]], on="date", how="left")
+        snowy = merged_amp[(merged_amp["new_snow_cm"] > 0) & (merged_amp["snowfall_24h"] > 0)]
+        amp = float(snowy["new_snow_cm"].mean() / snowy["snowfall_24h"].mean()) if len(snowy) > 10 else 1.0
+
+        daily["nwp_amplification"]    = amp
+        daily["amplified_snowfall_24h"] = daily["snowfall_24h"] * amp
+        daily["amplified_snowfall_48h"] = daily["snowfall_48h"] * amp
+
+        # ERA5 new_snow_cm as proxy (same scale as training labels → meaningful powder threshold)
+        era5_map = sh_lab.set_index("date")["new_snow_cm"]
+        daily["proxy_snow_cm"] = daily.index.normalize().map(era5_map).fillna(0.0)
+    else:
+        daily["proxy_snow_cm"] = daily["snowfall_24h"].clip(0)
 
     X = daily.reindex(columns=feat_cols, fill_value=0)
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -119,7 +150,6 @@ def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
 
     # No gate — must match forecast.py which gates AFTER calibration
     daily["japan_model_raw"] = raw_preds
-    daily["proxy_snow_cm"]   = daily["snowfall_24h"].clip(0)
 
     return daily[daily.index.month.isin(SH_SEASON_MONTHS)].copy()
 
@@ -174,6 +204,10 @@ def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float) -
     else:
         r = r_raw = float("nan")
 
+    # Store nwp_amplification factor (from Japan-model path; 1.0 for NWP-direct)
+    amp_factor = float(calib_df["nwp_amplification"].iloc[0]) \
+        if "nwp_amplification" in calib_df.columns else 1.0
+
     result = {
         "resort_id":           resort_id,
         "n_calib_rows":        len(calib_df),
@@ -183,6 +217,7 @@ def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float) -
         "powder_threshold_raw_equiv": round(raw_at_powder, 3),
         "r_before_calib":      round(r_raw, 3),
         "r_after_calib":       round(r, 3),
+        "nwp_amplification":   round(amp_factor, 3),
         # Store the isotonic mapping as sorted x/y arrays for serialisation
         "iso_x": iso.X_thresholds_.tolist(),
         "iso_y": iso.y_thresholds_.tolist(),

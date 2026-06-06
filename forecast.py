@@ -123,6 +123,14 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
         preds = daily["snowfall_48h"].clip(0).values
     else:
         # ── Japan model path (Japan + Andes resorts) ──────────────────────────
+        # Inject nwp_amplification from the stored calibration so the amplified
+        # snowfall features match the values seen during training.
+        if calib and not calib.get("nwp_direct"):
+            amp = calib.get("nwp_amplification", 1.0)
+            daily["nwp_amplification"]      = amp
+            daily["amplified_snowfall_24h"] = daily["snowfall_24h"] * amp
+            daily["amplified_snowfall_48h"] = daily["snowfall_48h"] * amp
+
         X = daily.reindex(columns=feat_cols, fill_value=0)
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
         X.fillna(0, inplace=True)

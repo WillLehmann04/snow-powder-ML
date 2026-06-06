@@ -236,9 +236,14 @@ def train(
     p_train = model.predict(X_train).clip(0)
     p_test  = model.predict(X_test).clip(0)
 
-    # Threshold calibrated on training data only, then applied to both splits
-    powder_pred_thresh = _find_best_threshold(y_train, p_train)
-    print(f"\n  Powder detection threshold (F1-optimal on train): {powder_pred_thresh:.2f}cm")
+    # Threshold calibrated on Japan training rows only.
+    # SH resorts use ERA5 snow_depth labels which rarely exceed 15cm (their actual
+    # powder threshold is 4-5cm, not 15cm), so including them in threshold
+    # optimisation pulls the cut-off too high and hurts Japan recall.
+    japan_mask = (train_df["hemisphere"] == "north").values if "hemisphere" in train_df.columns \
+                 else np.ones(len(y_train), dtype=bool)
+    powder_pred_thresh = _find_best_threshold(y_train[japan_mask], p_train[japan_mask])
+    print(f"\n  Powder detection threshold (F1-optimal on Japan train): {powder_pred_thresh:.2f}cm")
 
     print("\n--- TRAIN metrics ---")
     train_metrics = _metrics(y_train, p_train, powder_pred_thresh)
