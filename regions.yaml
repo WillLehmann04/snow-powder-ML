@@ -7,6 +7,9 @@
 # elevation      : metres above sea level (summit / upper station)
 # region         : sub-national grouping (categorical model feature)
 # hemisphere     : north | south (determines season-year logic)
+# dist_coast_km  : approximate great-circle distance to the nearest ocean coastline (km)
+#                  Used to derive maritime_influence = 100 / (dist + 10), a proxy for
+#                  how much ocean moisture modulates snowfall frequency and intensity.
 
 # ── Hokkaido ──────────────────────────────────────────────────────────────────
 niseko_grand_hirafu:
@@ -17,6 +20,7 @@ niseko_grand_hirafu:
   snowjapan_id: 369
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 20   # Japan Sea coast ~20 km west
 
 niseko_annupuri:
   lat: 42.8989
@@ -26,6 +30,8 @@ niseko_annupuri:
   snowjapan_id: 368
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 22
+  hidden: true  # excluded from training (systematic under-reporting); hidden from default forecast output
 
 rusutsu:
   lat: 42.7498
@@ -35,6 +41,7 @@ rusutsu:
   snowjapan_id: 439
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 28   # slightly inland from Japan Sea coast
 
 furano:
   lat: 43.2641
@@ -44,6 +51,7 @@ furano:
   snowjapan_id: 99
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 110  # central Hokkaido, inland
 
 kiroro:
   lat: 43.0950
@@ -53,6 +61,7 @@ kiroro:
   snowjapan_id: 243
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 18   # Japan Sea coast ~18 km west
 
 sahoro:
   lat: 43.1040
@@ -62,6 +71,7 @@ sahoro:
   snowjapan_id: 441
   region: hokkaido
   hemisphere: north
+  dist_coast_km: 190  # deep inland Hokkaido
 
 # ── Tohoku (northern Honshu) ──────────────────────────────────────────────────
 zao:
@@ -72,6 +82,7 @@ zao:
   snowjapan_id: 607
   region: tohoku
   hemisphere: north
+  dist_coast_km: 75   # Pacific coast ~75 km east
 
 appi_kogen:
   lat: 39.9520
@@ -81,6 +92,7 @@ appi_kogen:
   snowjapan_id: 27
   region: tohoku
   hemisphere: north
+  dist_coast_km: 95   # Pacific coast ~95 km east
 
 geto_kogen:
   lat: 39.2310
@@ -90,6 +102,7 @@ geto_kogen:
   snowjapan_id: 107
   region: tohoku
   hemisphere: north
+  dist_coast_km: 80   # Pacific coast ~80 km east
 
 # ── Niigata / Nagano (central Honshu) ────────────────────────────────────────
 naeba:
@@ -100,6 +113,7 @@ naeba:
   snowjapan_id: 344
   region: niigata
   hemisphere: north
+  dist_coast_km: 65   # Japan Sea coast ~65 km NW (moisture highway)
 
 myoko_suginohara:
   lat: 36.9940
@@ -109,6 +123,7 @@ myoko_suginohara:
   snowjapan_id: 343
   region: niigata
   hemisphere: north
+  dist_coast_km: 58   # Japan Sea coast ~58 km NW
 
 nozawaonsen:
   lat: 36.9230
@@ -118,6 +133,7 @@ nozawaonsen:
   snowjapan_id: 384
   region: nagano
   hemisphere: north
+  dist_coast_km: 75   # Japan Sea coast ~75 km NW
 
 hakuba_happo:
   lat: 36.6984
@@ -127,6 +143,7 @@ hakuba_happo:
   snowjapan_id: 142
   region: nagano
   hemisphere: north
+  dist_coast_km: 110  # Japan Sea coast ~110 km WNW (mountains block direct moisture)
 
 hakuba_goryu:
   lat: 36.6750
@@ -136,6 +153,7 @@ hakuba_goryu:
   snowjapan_id: 129
   region: nagano
   hemisphere: north
+  dist_coast_km: 112
 
 shiga_kogen:
   lat: 36.7908
@@ -145,6 +163,7 @@ shiga_kogen:
   snowjapan_id: 463
   region: nagano
   hemisphere: north
+  dist_coast_km: 145  # furthest inland Nagano resort
 
 madarao:
   lat: 36.8650
@@ -154,6 +173,7 @@ madarao:
   snowjapan_id: 290
   region: nagano
   hemisphere: north
+  dist_coast_km: 78
 
 akakura_kanko:
   lat: 36.9990
@@ -163,6 +183,7 @@ akakura_kanko:
   snowjapan_id: 15
   region: niigata
   hemisphere: north
+  dist_coast_km: 60
 
 iwappara:
   lat: 36.9470
@@ -172,6 +193,7 @@ iwappara:
   snowjapan_id: 203
   region: niigata
   hemisphere: north
+  dist_coast_km: 70
 
 # ── Australia ─────────────────────────────────────────────────────────────────
 # Forecast uses NWP-direct path (Open-Meteo snowfall + temp gate).
@@ -183,6 +205,9 @@ thredbo:
   elevation: 2037
   region: nsw
   hemisphere: south
+  dist_coast_km: 195  # Tasman Sea coast ~195 km east
+  opens_month: 6
+  closes_month: 10
   snow_report_url: https://www.thredbo.com.au/mountain-information/snow-report/
   snow_report_format: livepass_xml
 
@@ -192,8 +217,11 @@ perisher:
   elevation: 2054
   region: nsw
   hemisphere: south
-  snow_report_url: https://www.perisher.com.au/mountain-information/snow-report/
-  snow_report_format: livepass_xml
+  dist_coast_km: 190  # Tasman Sea coast ~190 km east
+  opens_month: 6
+  closes_month: 9
+  snow_report_url: https://www.perisher.com.au/reports-cams/reports/snow-report
+  snow_report_format: perisher_html
 
 falls_creek:
   lat: -36.8677
@@ -201,8 +229,11 @@ falls_creek:
   elevation: 1780
   region: victoria
   hemisphere: south
-  snow_report_url: https://www.fallscreek.com.au/mountain-information/snow-report/
-  snow_report_format: livepass_xml
+  dist_coast_km: 310  # deeply inland Victoria
+  opens_month: 6
+  closes_month: 9
+  snow_report_url: https://www.fallscreek.com.au/wp-content/uploads/FCSnowReport_2021.json
+  snow_report_format: falls_creek_json
 
 # ── New Zealand ───────────────────────────────────────────────────────────────
 cardrona:
@@ -211,6 +242,11 @@ cardrona:
   elevation: 1894
   region: nz_south
   hemisphere: south
+  dist_coast_km: 95   # Tasman Sea / Foveaux Strait ~95 km SW
+  opens_month: 6
+  closes_month: 10
+  # No structured API available — JS-rendered Contentful/Next.js site.
+  # Use ERA5 proxy labels until a public API is found.
 
 treble_cone:
   lat: -44.6270
@@ -218,6 +254,10 @@ treble_cone:
   elevation: 1950
   region: nz_south
   hemisphere: south
+  dist_coast_km: 90   # Lake Wanaka / Haast Pass moisture corridor
+  opens_month: 6
+  closes_month: 10
+  # No structured API available — same platform as Cardrona.
 
 mt_hutt:
   lat: -43.4980
@@ -225,6 +265,10 @@ mt_hutt:
   elevation: 2086
   region: nz_south
   hemisphere: south
+  dist_coast_km: 75   # Canterbury coast ~75 km east
+  opens_month: 6
+  closes_month: 10
+  # No structured API available — NZSki Webflow site, JS-rendered.
 
 coronet_peak:
   lat: -45.0610
@@ -232,6 +276,10 @@ coronet_peak:
   elevation: 1651
   region: nz_south
   hemisphere: south
+  dist_coast_km: 85   # Foveaux Strait ~85 km SW
+  opens_month: 6
+  closes_month: 10
+  # No structured API available — NZSki Webflow/Sitecore, JS-rendered.
 
 the_remarkables:
   lat: -45.0320
@@ -239,6 +287,10 @@ the_remarkables:
   elevation: 1945
   region: nz_south
   hemisphere: south
+  dist_coast_km: 80   # Foveaux Strait ~80 km SW
+  opens_month: 6
+  closes_month: 10
+  # No structured API available — NZSki Webflow/Sitecore, JS-rendered.
 
 whakapapa:
   lat: -39.2340
@@ -246,6 +298,11 @@ whakapapa:
   elevation: 2020
   region: nz_north
   hemisphere: south
+  dist_coast_km: 55   # Tasman Sea coast ~55 km west (exposed to fronts)
+  opens_month: 6
+  closes_month: 10
+  snow_report_url: https://www.whakapapa.com/report
+  snow_report_format: whakapapa_lit
 
 # ── South America ─────────────────────────────────────────────────────────────
 valle_nevado:
@@ -254,6 +311,9 @@ valle_nevado:
   elevation: 3670
   region: andes_chile
   hemisphere: south
+  dist_coast_km: 120  # Pacific coast ~120 km west
+  opens_month: 6
+  closes_month: 9
 
 portillo:
   lat: -32.8360
@@ -261,6 +321,9 @@ portillo:
   elevation: 2880
   region: andes_chile
   hemisphere: south
+  dist_coast_km: 150  # Pacific coast ~150 km west
+  opens_month: 6
+  closes_month: 10
 
 las_lenas:
   lat: -35.1530
@@ -268,6 +331,9 @@ las_lenas:
   elevation: 3430
   region: andes_argentina
   hemisphere: south
+  dist_coast_km: 420  # Atlantic coast ~420 km east, Pacific ~200 km west
+  opens_month: 6
+  closes_month: 9
 
 catedral_bariloche:
   lat: -41.1680
@@ -275,3 +341,20 @@ catedral_bariloche:
   elevation: 1934
   region: andes_argentina
   hemisphere: south
+  dist_coast_km: 130  # Atlantic coast ~130 km east (maritime Patagonian influence)
+  opens_month: 6
+  closes_month: 9
+
+# ── British Columbia ───────────────────────────────────────────────────────────
+whistler_blackcomb:
+  lat: 50.0651
+  lon: -122.9497
+  elevation: 2182
+  region: bc_canada
+  hemisphere: north
+  dist_coast_km: 65   # Pacific coast ~65 km WSW (Howe Sound); maritime Pacific climate
+  opens_month: 11
+  closes_month: 4
+  era5_labels: true   # No SnowJapan equivalent — use ERA5 snow_depth change as label proxy
+  # LivePass XML endpoint exists but no historical API — ERA5 proxy used until
+  # resort_snapshot.py accumulates ≥2 seasons of daily reports.

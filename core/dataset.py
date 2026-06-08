@@ -37,6 +37,7 @@ REGION_MAP = {
     "nz_north":        7,
     "andes_chile":     8,
     "andes_argentina": 9,
+    "bc_canada":       10,
 }
 
 # Physical plausibility cap on overnight snowfall (cm).
@@ -82,6 +83,35 @@ def build(
     if dropped:
         print(f"  Dropped {dropped} rows with overnight_snow_cm > {label_cap}cm (artifacts)")
 
+    # Resorts excluded from training — label quality or label-scale issues.
+    #
+    # niseko_annupuri: r=0.250 vs adjacent Hirafu (3.8km, same NWP grid).
+    #   Systematic under-reporting by SnowJapan recorder. ~100 vs 211 powder days.
+    #
+    # sahoro: r=0.149 on 2022-2023 holdout — essentially random. 190km inland
+    #   Hokkaido; Pacific moisture pathway not captured by the current feature set.
+    #
+    # AU/NZ resorts (9): ERA5 snow_depth labels average 3-5cm on snow days vs Japan's
+    #   15cm observed. Training on this 3x scale mismatch pulls the regressor toward
+    #   a compressed distribution, causing systematic underprediction on Japan powder
+    #   days. These resorts all go through transfer calibration anyway — they do not
+    #   need to contribute to the Japan model's training distribution.
+    #
+    # Resorts remain in regions.yaml and forecast.py; exclusion is training-only.
+    TRAINING_EXCLUDE = {
+        "niseko_annupuri",
+        "sahoro",
+        # AU
+        "thredbo", "perisher", "falls_creek",
+        # NZ
+        "cardrona", "treble_cone", "mt_hutt", "coronet_peak", "the_remarkables", "whakapapa",
+    }
+    excluded = labels[labels["resort_id"].isin(TRAINING_EXCLUDE)]
+    if not excluded.empty:
+        print(f"  Excluding {len(excluded)} rows from {sorted(excluded['resort_id'].unique())} "
+              f"(label-quality blocklist)")
+    labels = labels[~labels["resort_id"].isin(TRAINING_EXCLUDE)].copy()
+
     print("\nJoining with weather features ...")
     regions = load_regions()
     frames  = []
@@ -107,12 +137,17 @@ def build(
 
         # Add static resort features
         cfg = regions.get(resort_id, {})
-        merged["elevation"]   = cfg.get("elevation", np.nan)
-        merged["lat"]         = cfg.get("lat",       np.nan)
-        merged["lon"]         = cfg.get("lon",       np.nan)
-        merged["region"]      = cfg.get("region",    "unknown")
-        merged["hemisphere"]  = cfg.get("hemisphere","north")
-        merged["region_code"] = REGION_MAP.get(cfg.get("region", ""), -1)
+        merged["elevation"]          = cfg.get("elevation", np.nan)
+        merged["lat"]                = cfg.get("lat",       np.nan)
+        merged["lon"]                = cfg.get("lon",       np.nan)
+        merged["region"]             = cfg.get("region",    "unknown")
+        merged["hemisphere"]         = cfg.get("hemisphere","north")
+        merged["region_code"]        = REGION_MAP.get(cfg.get("region", ""), -1)
+        # Maritime influence: 100 / (dist_coast_km + 10)
+        # Ranges ~0.7 (Las Lenas, ~420km) to ~5.0 (Whakapapa, ~55km) to ~4.5 (Kiroro, ~18km).
+        # Captures how much ocean moisture is available — Hokkaido coast = high, inland = low.
+        dist_coast = cfg.get("dist_coast_km", 100.0)
+        merged["maritime_influence"] = 100.0 / (float(dist_coast) + 10.0)
 
         frames.append(merged)
         print(f"  [{resort_id}] {len(merged):,} rows")
@@ -153,6 +188,17 @@ def build(
         .apply(lambda g: g["overnight_snow_cm"].mean() / g["snowfall_24h"].mean(), include_groups=False)
         .rename("nwp_amplification")
     )
+
+    # Cap implausible amplification. Values above 6x indicate data quality issues
+    # or a severely misplaced NWP grid point (geto_kogen was 10.9x before this cap).
+    AMP_CAP = 6.0
+    flagged = amp[amp > AMP_CAP]
+    if not flagged.empty:
+        print(f"  WARNING: nwp_amplification capped at {AMP_CAP}x for:")
+        for _rid, _val in flagged.items():
+            print(f"    {_rid}: {_val:.2f}x -> {AMP_CAP}x")
+    amp = amp.clip(upper=AMP_CAP)
+
     df["nwp_amplification"] = df["resort_id"].map(amp).fillna(1.0)
 
     # Explicit amplified snowfall features — multiplicative interactions that

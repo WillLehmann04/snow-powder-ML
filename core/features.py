@@ -180,29 +180,42 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
     _sy = _season_year_south if hemisphere == "south" else _season_year_north
     d = _agg_daily(hourly)
 
-    # ── Rolling snow windows ───────────────────────────────────────────────────
-    d["snowfall_48h"]      = d["snowfall_24h"].rolling(2,  min_periods=1).sum()
-    d["snowfall_72h"]      = d["snowfall_24h"].rolling(3,  min_periods=1).sum()
-    d["snowfall_7d"]       = d["snowfall_24h"].rolling(7,  min_periods=1).sum()
-    d["snowfall_14d"]      = d["snowfall_24h"].rolling(14, min_periods=1).sum()
-    d["snowfall_last_30d"] = d["snowfall_24h"].rolling(30, min_periods=1).sum()
+    # ── Season year — computed once, kept through all season-grouped ops ─────────
+    d["_sy_tmp"] = d.index.map(_sy)
 
-    # ── Freeze-thaw rolling ────────────────────────────────────────────────────
-    d["freeze_thaw_count_7d"] = d["freeze_thaw_event"].rolling(7, min_periods=1).sum()
+    # ── Rolling snow windows (reset per season to avoid cross-season bleed) ──────
+    for _col, _win in [
+        ("snowfall_48h", 2), ("snowfall_72h", 3), ("snowfall_7d", 7),
+        ("snowfall_14d", 14), ("snowfall_last_30d", 30),
+    ]:
+        d[_col] = (
+            d.groupby("_sy_tmp")["snowfall_24h"]
+            .transform(lambda s, w=_win: s.rolling(w, min_periods=1).sum())
+        )
+
+    # ── Freeze-thaw rolling (also season-bounded) ─────────────────────────────
+    d["freeze_thaw_count_7d"] = (
+        d.groupby("_sy_tmp")["freeze_thaw_event"]
+        .transform(lambda s: s.rolling(7, min_periods=1).sum())
+    )
 
     # ── Seasonal cumulative ────────────────────────────────────────────────────
-    d["_season_year"] = d.index.map(_sy)
-    d["seasonal_snowfall_total"] = d.groupby("_season_year")["snowfall_24h"].cumsum()
-    d.drop(columns=["_season_year"], inplace=True)
+    d["seasonal_snowfall_total"] = d.groupby("_sy_tmp")["snowfall_24h"].cumsum()
 
-    # ── Pressure features ─────────────────────────────────────────────────────
+    # ── Pressure features (season-bounded to avoid season-start contamination) ──
     if "pressure_mean" in d.columns:
         # 24h tendency: falling pressure = incoming storm (most important sign)
-        d["pressure_tendency_24h"] = d["pressure_mean"].diff(1).fillna(0)
+        d["pressure_tendency_24h"] = d.groupby("_sy_tmp")["pressure_mean"].transform(
+            lambda s: s.diff(1).fillna(0)
+        )
         # 3-day tendency: sustained pattern
-        d["pressure_tendency_3d"]  = d["pressure_mean"].diff(3).fillna(0)
+        d["pressure_tendency_3d"] = d.groupby("_sy_tmp")["pressure_mean"].transform(
+            lambda s: s.diff(3).fillna(0)
+        )
         # Anomaly from 7-day rolling mean: deviations from local baseline
-        d["pressure_anomaly"]      = d["pressure_mean"] - d["pressure_mean"].rolling(7, min_periods=1).mean()
+        d["pressure_anomaly"] = d.groupby("_sy_tmp")["pressure_mean"].transform(
+            lambda s: (s - s.rolling(7, min_periods=1).mean()).fillna(0)
+        )
     else:
         d["pressure_tendency_24h"] = 0.0
         d["pressure_tendency_3d"]  = 0.0
@@ -242,9 +255,12 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
     if "wind_dir_mean" in d.columns and d["wind_dir_mean"].notna().any():
         d["wind_dir_sin"] = np.sin(np.deg2rad(d["wind_dir_mean"].fillna(0)))
         d["wind_dir_cos"] = np.cos(np.deg2rad(d["wind_dir_mean"].fillna(0)))
-        # Same during snowfall hours — the directionally important signal
-        d["wind_dir_snow_sin"] = np.sin(np.deg2rad(d["wind_dir_during_snow"].fillna(0)))
-        d["wind_dir_snow_cos"] = np.cos(np.deg2rad(d["wind_dir_during_snow"].fillna(0)))
+        # On no-snow days, fill wind_dir_during_snow with the day's overall wind
+        # direction (not 0°=North, which would encode a spurious Siberian-outbreak
+        # signal on clear dry days).
+        wind_dir_snow_filled = d["wind_dir_during_snow"].fillna(d["wind_dir_mean"].fillna(0))
+        d["wind_dir_snow_sin"] = np.sin(np.deg2rad(wind_dir_snow_filled))
+        d["wind_dir_snow_cos"] = np.cos(np.deg2rad(wind_dir_snow_filled))
     else:
         d["wind_dir_sin"] = d["wind_dir_cos"] = 0.0
         d["wind_dir_snow_sin"] = d["wind_dir_snow_cos"] = 0.0
@@ -271,10 +287,20 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
     # ── Wind loading (capped) ─────────────────────────────────────────────────
     d["wind_loading_index"] = (d["wind_max"] * d["snowfall_24h"]).clip(upper=100)
 
-    # ── Time since storm peak ─────────────────────────────────────────────────
+    # ── Time since storm peak (season-bounded) ────────────────────────────────
+    # Look back up to 6 days but stop at season boundary so the previous
+    # season's big storm doesn't bleed into opening week of the new season.
+    _sy_arr = d["_sy_tmp"].values
     tsp = []
     for i, dt in enumerate(d.index):
-        window = d.iloc[max(0, i - 6): i + 1]["snowfall_24h"]
+        cur_sy = _sy_arr[i]
+        lookback_start = i
+        for j in range(i - 1, max(-1, i - 7), -1):
+            if _sy_arr[j] == cur_sy:
+                lookback_start = j
+            else:
+                break
+        window = d.iloc[lookback_start: i + 1]["snowfall_24h"]
         tsp.append((dt - window.idxmax()).days)
     d["time_since_storm_peak"] = tsp
 
@@ -300,15 +326,18 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
 
     d["wind_damage_score"] = d["wind_during_snow_mean"] * d["snowfall_24h"]
 
-    # ── Cold air advection index ──────────────────────────────────────────────
-    # Captures Siberian cold air outbreak pattern: rising pressure + cold temps
-    # + NW wind off the Sea of Japan. Audit showed these conditions dominate the
-    # model's worst misses (actual >30cm but pred <20cm).
-    # Rising pressure × cold temp_min × NW wind component (negative u = from west)
+    # ── Cold air advection index (hemisphere-aware) ───────────────────────────
+    # NH (Japan): Siberian outbreak = rising pressure + cold temps + NW wind.
+    # SH (AU/NZ/Andes): Antarctic front = rising pressure + cold temps + S/SW wind.
     pressure_rise = d["pressure_tendency_24h"].clip(lower=0)
     cold_temp     = (-d["temp_min"]).clip(lower=0)
-    nw_wind       = (-d["wind_u_during_snow"]).clip(lower=0)
-    d["cold_air_advection"] = pressure_rise * cold_temp * nw_wind
+    if hemisphere == "north":
+        # NW component: negative wind_u means flow from the west (Siberian outbreak)
+        cold_wind = (-d["wind_u_during_snow"]).clip(lower=0)
+    else:
+        # Southerly component: negative wind_v means flow from the south (Antarctic front)
+        cold_wind = (-d["wind_v_during_snow"]).clip(lower=0)
+    d["cold_air_advection"] = pressure_rise * cold_temp * cold_wind
 
     # ── Temporal / trend ──────────────────────────────────────────────────────
     d["wind_after_storm"] = d["wind_mean"] * d["time_since_storm_peak"]
@@ -317,7 +346,8 @@ def build_features(hourly: pd.DataFrame, hemisphere: str = "north") -> pd.DataFr
     # ── Calendar ──────────────────────────────────────────────────────────────
     d["day_of_year"]    = d.index.day_of_year
     d["month"]          = d.index.month
-    d["season_year"]    = d.index.map(_sy)
-    d["days_in_season"] = d.groupby("season_year").cumcount()
+    d["season_year"]    = d["_sy_tmp"]
+    d["days_in_season"] = d.groupby("_sy_tmp").cumcount()
 
+    d.drop(columns=["_sy_tmp"], inplace=True)
     return d

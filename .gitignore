@@ -1,0 +1,26 @@
+# Environment / secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# Data (large binary / generated files — don't commit)
+data/raw/weather/*.csv
+data/raw/snowjapan/*.json
+data/raw/snow_depth/*.csv
+data/raw/snow_reports/*.csv
+data/processed/*.csv
+data/processed/*.parquet
+
+# Model artifacts (large binaries — use DVC or artifact store for versioning)
+data/models/*.pkl
+
+# Plots (generated)
+data/plots/*.png

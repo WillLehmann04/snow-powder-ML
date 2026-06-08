@@ -47,8 +47,20 @@ def fetch_hourly(
     end: str,
     forecast: bool = False,
 ) -> pd.DataFrame:
-    """Fetch hourly weather from Open-Meteo. Returns DataFrame indexed by UTC time."""
-    url = FORECAST_URL if forecast else ARCHIVE_URL
+    """Fetch hourly weather from Open-Meteo. Returns DataFrame indexed by UTC time.
+
+    URL + variable selection:
+    - forecast=True                         → FORECAST_URL   + 850hPa
+    - forecast=False, start ≥ 2021-03-23   → HIST_FORECAST_URL + 850hPa
+    - forecast=False, start <  2021-03-23  → ARCHIVE_URL, surface only
+    """
+    if forecast or pd.Timestamp(start) >= pd.Timestamp(PRESSURE_LEVEL_START):
+        url         = FORECAST_URL if forecast else HIST_FORECAST_URL
+        hourly_vars = HOURLY_VARS + PRESSURE_LEVEL_VARS
+    else:
+        url         = ARCHIVE_URL
+        hourly_vars = HOURLY_VARS
+
     resp = requests.get(
         url,
         params={
@@ -56,7 +68,7 @@ def fetch_hourly(
             "longitude":          lon,
             "start_date":         start,
             "end_date":           end,
-            "hourly":             ",".join(HOURLY_VARS),
+            "hourly":             ",".join(hourly_vars),
             "timezone":           "auto",
             "wind_speed_unit":    "kmh",
             "precipitation_unit": "mm",
