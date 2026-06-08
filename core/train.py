@@ -27,7 +27,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from xgboost import XGBRegressor
+from sklearn.isotonic import IsotonicRegression
+from xgboost import XGBClassifier, XGBRegressor
 
 DATASET_PATH = Path("data/processed/training_dataset.parquet")
 MODEL_PATH   = Path("data/models/xgb_overnight_snow.pkl")
@@ -75,18 +76,14 @@ FEATURE_COLS = [
     "wind_after_storm", "temp_trend",
     # ── Calendar ───────────────────────────────────────────────────────────
     "day_of_year", "month", "days_in_season",
-    # ── Observed snow lags (actual new snow, not NWP) ─────────────────────
-    "overnight_snow_lag1",   # yesterday's actual new snow — multi-day storm signal
-    "overnight_snow_lag2",   # two days ago
-    "overnight_snow_3d_sum", # lag1 + lag2 observed accumulation
-    # ── Snowpack state (observed) ─────────────────────────────────────────
-    "snow_depth_lag1",
     # ── NWP bias correction ───────────────────────────────────────────────
     "nwp_amplification",
     "amplified_snowfall_24h",  # snowfall_24h × nwp_amplification
     "amplified_snowfall_48h",  # snowfall_48h × nwp_amplification
     # ── Static resort ──────────────────────────────────────────────────────
     "elevation", "lat", "lon", "region_code",
+    # Maritime influence = 100 / (dist_coast_km + 10); higher = more ocean moisture
+    "maritime_influence",
 ]
 
 TARGET = "overnight_snow_cm"
@@ -195,20 +192,68 @@ def train(
     print(f"  Test:  {len(test_df):,} rows ({test_df['season'].nunique()} seasons: "
           f"{sorted(test_df['season'].unique())[0]} – {sorted(test_df['season'].unique())[-1]})")
 
+    # ── Recompute NWP amplification from training rows only ──────────────────
+    # dataset.py computes amplification on all rows; here we recompute on
+    # training rows only so test-set labels don't contaminate the feature.
+    train_df = train_df.copy()
+    test_df  = test_df.copy()
+    snowy_train = train_df[(train_df[TARGET] > 0) & (train_df["snowfall_24h"] > 0)]
+    amp_train = (
+        snowy_train.groupby("resort_id")
+        .apply(lambda g: g[TARGET].mean() / g["snowfall_24h"].mean(), include_groups=False)
+        .clip(upper=6.0)
+        .fillna(1.0)
+    )
+    amp_per_resort = amp_train.to_dict()
+    for part in (train_df, test_df):
+        part["nwp_amplification"]       = part["resort_id"].map(amp_per_resort).fillna(1.0)
+        part["amplified_snowfall_24h"]  = part["snowfall_24h"] * part["nwp_amplification"]
+        part["amplified_snowfall_48h"]  = part["snowfall_48h"] * part["nwp_amplification"]
+    print("  NWP amplification recomputed from training rows only")
+
     X_train = _prep_X(train_df)
     X_test  = _prep_X(test_df)
     y_train = train_df[TARGET].values
     y_test  = test_df[TARGET].values
 
+    # ── Stage 1: Binary snow classifier ─────────────────────────────────────
+    # Independently learns P(any snow today). Used as a gate at inference:
+    # predictions are zeroed when P(snow) < SNOW_GATE_THRESHOLD, reducing
+    # false-positive powder alerts on clear-but-cold days.
+    SNOW_GATE_THRESHOLD = 0.20
+    snow_labels = (y_train >= 0.5).astype(int)
+    pos_weight  = float((snow_labels == 0).sum()) / max(1, (snow_labels == 1).sum())
+    snow_classifier = XGBClassifier(
+        n_estimators       = 300,
+        max_depth          = 4,
+        learning_rate      = 0.05,
+        subsample          = 0.8,
+        colsample_bytree   = 0.8,
+        scale_pos_weight   = pos_weight,
+        objective          = "binary:logistic",
+        eval_metric        = "logloss",
+        random_state       = 42,
+        n_jobs             = -1,
+    )
+    snow_classifier.fit(X_train, snow_labels, verbose=False)
+    p_snow_train = snow_classifier.predict_proba(X_train)[:, 1]
+    gate_accuracy = ((p_snow_train >= SNOW_GATE_THRESHOLD) == snow_labels.astype(bool)).mean()
+    print(f"  Snow classifier gate accuracy (P≥{SNOW_GATE_THRESHOLD}): {gate_accuracy:.3f}")
+
     # ── Model — Tweedie distribution ─────────────────────────────────────────
-    # Tweedie (variance_power between 1 and 2) is designed for zero-inflated,
-    # right-skewed positive data — exactly our target distribution (76% zeros,
-    # long tail to 80cm). It doesn't need a log-transform: the log-link and
-    # compound Poisson-Gamma structure handle the zeros natively.
-    # variance_power=1.2 (tuned): closer to Poisson than Gamma, which fits the
-    # overnight snowfall distribution (many zeros, discrete-ish counts) better.
-    model = XGBRegressor(
-        n_estimators          = 800,
+    # variance_power=1.2: close to Poisson, well-calibrated for Japan's skewed
+    # snowfall distribution. VP=1.5 early-stopped at only 279 trees (-0.11 Japan r).
+    #
+    # 2.0x sample weight for actual powder days (>=15cm).
+    # Audit finding: model predicts only 10-18cm on actual 20-50cm events (regression
+    # to mean). AU/NZ label scale mismatch (3x smaller) is addressed by excluding
+    # those resorts from training; this gentle upweighting further corrects for
+    # the large mass of 0-5cm days drowning out the powder-day gradient signal.
+    # Previous attempt at 6x/3x degraded precision — 2x is the calibrated compromise.
+    sample_weight = np.where(y_train >= 15.0, 2.0, 1.0).astype(float)
+
+    VARIANCE_POWER = 1.2
+    _xgb_kwargs = dict(
         max_depth             = 5,
         learning_rate         = 0.04,
         subsample             = 0.8,
@@ -217,33 +262,70 @@ def train(
         reg_alpha             = 0.1,
         reg_lambda            = 1.0,
         objective             = "reg:tweedie",
-        tweedie_variance_power= 1.2,
-        eval_metric           = "tweedie-nloglik@1.2",
-        early_stopping_rounds = 30,
+        tweedie_variance_power= VARIANCE_POWER,
+        eval_metric           = f"tweedie-nloglik@{VARIANCE_POWER}",
         random_state          = 42,
         n_jobs                = -1,
     )
 
-    print("\nTraining (Tweedie distribution) ...")
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=50,
-    )
-    print(f"  Best iteration: {model.best_iteration}")
+    # ── Early stopping on internal validation split ───────────────────────────
+    # Use the last training season as the validation set to find the optimal
+    # n_estimators. The blind test holdout is never seen during this search.
+    val_season = sorted(train_df["season"].unique())[-1]
+    val_mask   = train_df["season"] == val_season
+    X_tr2 = _prep_X(train_df[~val_mask])
+    y_tr2 = y_train[~val_mask.values]
+    X_val = _prep_X(train_df[val_mask])
+    y_val = y_train[val_mask.values]
+    print(f"\nEarly stopping validation: season {val_season} ({val_mask.sum()} rows)")
 
-    # Tweedie outputs are already in cm (positive, via log-link internally)
-    p_train = model.predict(X_train).clip(0)
-    p_test  = model.predict(X_test).clip(0)
+    sw_tr2 = sample_weight[~val_mask.values]
+    early_model = XGBRegressor(n_estimators=800, early_stopping_rounds=30, **_xgb_kwargs)
+    early_model.fit(X_tr2, y_tr2, sample_weight=sw_tr2, eval_set=[(X_val, y_val)], verbose=50)
+    best_n = early_model.best_iteration + 1
+    print(f"  Best iteration: {best_n}")
 
-    # Threshold calibrated on Japan training rows only.
+    # Retrain on ALL training data with the fixed n_estimators found above.
+    # This uses every training row for the final model weights.
+    print(f"\nRetraining on full training set with n_estimators={best_n} ...")
+    model = XGBRegressor(n_estimators=best_n, **_xgb_kwargs)
+    model.fit(X_train, y_train, sample_weight=sample_weight, verbose=False)
+
+    # Tweedie outputs are already in cm (positive, via log-link internally).
+    # Apply classifier gate: zero predictions when P(snow) < threshold.
+    p_train_raw = model.predict(X_train).clip(0)
+    p_test_raw  = model.predict(X_test).clip(0)
+
+    p_snow_train = snow_classifier.predict_proba(X_train)[:, 1]
+    p_snow_test  = snow_classifier.predict_proba(X_test)[:, 1]
+    p_train = p_train_raw * (p_snow_train >= SNOW_GATE_THRESHOLD)
+    p_test  = p_test_raw  * (p_snow_test  >= SNOW_GATE_THRESHOLD)
+
+    japan_mask = (train_df["hemisphere"] == "north").values if "hemisphere" in train_df.columns \
+                 else np.ones(len(y_train), dtype=bool)
+
+    # ── Post-hoc Japan isotonic correction ────────────────────────────────────
+    # XGBoost Tweedie regresses toward the mean — rare extreme events (>20cm) are
+    # systematically underpredicted because the loss is dominated by the 0-5cm mass.
+    # This monotonic correction is fitted on Japan NH training rows and stretches
+    # the compressed output range back to the real observed distribution.
+    # SH Andes calibration is re-fitted on the corrected output so inference is consistent.
+    jp_iso_corr = IsotonicRegression(out_of_bounds="clip", increasing=True)
+    jp_iso_corr.fit(p_train[japan_mask], y_train[japan_mask])
+    japan_correction = {
+        "iso_x": jp_iso_corr.X_thresholds_.tolist(),
+        "iso_y": jp_iso_corr.y_thresholds_.tolist(),
+    }
+    p_train = np.interp(p_train, jp_iso_corr.X_thresholds_, jp_iso_corr.y_thresholds_).clip(0)
+    p_test  = np.interp(p_test,  jp_iso_corr.X_thresholds_, jp_iso_corr.y_thresholds_).clip(0)
+    print(f"\n  Japan post-hoc correction fitted on {int(japan_mask.sum())} NH training rows")
+
+    # Threshold calibrated on Japan training rows only (post-correction).
     # SH resorts use ERA5 snow_depth labels which rarely exceed 15cm (their actual
     # powder threshold is 4-5cm, not 15cm), so including them in threshold
     # optimisation pulls the cut-off too high and hurts Japan recall.
-    japan_mask = (train_df["hemisphere"] == "north").values if "hemisphere" in train_df.columns \
-                 else np.ones(len(y_train), dtype=bool)
     powder_pred_thresh = _find_best_threshold(y_train[japan_mask], p_train[japan_mask])
-    print(f"\n  Powder detection threshold (F1-optimal on Japan train): {powder_pred_thresh:.2f}cm")
+    print(f"\n  Powder detection threshold (post-correction, F1-optimal on Japan train): {powder_pred_thresh:.2f}cm")
 
     print("\n--- TRAIN metrics ---")
     train_metrics = _metrics(y_train, p_train, powder_pred_thresh)
@@ -255,20 +337,38 @@ def train(
     for k, v in test_metrics.items():
         print(f"  {k}: {v}")
 
+    # ── Per-resort NWP amplification for inference ───────────────────────────
+    # Use the training-only values computed above (not the full-dataset version
+    # from dataset.py, which was overridden for correctness earlier in this function).
+    # amp_per_resort is already set above.
+
     # ── Save ─────────────────────────────────────────────────────────────────
+    import shutil
+    from datetime import datetime
+
     model_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "model":                 model,
-        "feature_cols":          FEATURE_COLS,
-        "holdout_season":        holdout_season,
-        "train_metrics":         train_metrics,
-        "test_metrics":          test_metrics,
-        "log_transform":         False,   # Tweedie handles zeros natively; no expm1 needed
-        "powder_pred_threshold": powder_pred_thresh,
+        "model":                        model,
+        "snow_classifier":              snow_classifier,
+        "snow_gate_threshold":          SNOW_GATE_THRESHOLD,
+        "feature_cols":                 FEATURE_COLS,
+        "holdout_season":               holdout_season,
+        "train_metrics":                train_metrics,
+        "test_metrics":                 test_metrics,
+        "log_transform":                False,
+        "powder_pred_threshold":        powder_pred_thresh,
+        "nwp_amplification_per_resort": amp_per_resort,
+        "japan_correction_iso":         japan_correction,
+        "trained_at":                   datetime.utcnow().isoformat(),
     }
-    with open(model_path, "wb") as f:
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    versioned_path = model_path.parent / f"xgb_overnight_snow_{ts}.pkl"
+    with open(versioned_path, "wb") as f:
         pickle.dump(payload, f)
-    print(f"\nModel saved -> {model_path}")
+    print(f"\nModel saved -> {versioned_path}")
+    shutil.copy2(versioned_path, model_path)
+    print(f"Latest    -> {model_path}")
     return payload
 
 

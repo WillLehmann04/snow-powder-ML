@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import calendar
 import json
 import pickle
 import sys
@@ -19,17 +20,31 @@ import pandas as pd
 import yaml
 
 from collectors.weather import fetch_hourly
+from core.conditions import estimate_condition
 from core.features import build_features
 
-MODEL_PATH   = Path("data/models/xgb_overnight_snow.pkl")
-CALIB_PATH   = Path("data/models/transfer_calibration.json")
-REGIONS_YAML = Path("regions.yaml")
+MODEL_PATH       = Path("data/models/xgb_overnight_snow.pkl")
+CALIB_PATH       = Path("data/models/transfer_calibration.json")
+NWP_MODELS_PATH  = Path("data/models/nwp_direct_models.pkl")
+REGIONS_YAML     = Path("regions.yaml")
+
+# Features used by the NWP-direct multi-feature XGBoost calibration model.
+NWP_DIRECT_FEATURES = [
+    "snowfall_48h", "snowfall_72h", "temp_min",
+    "hours_with_snow", "precipitation", "pressure_tendency_24h",
+]
+
+_HPA_COLS_SET = frozenset({
+    "temp_850_mean", "temp_850_min", "temp_850_max",
+    "temp_850_trend", "rain_risk_850", "freeze_depth_850",
+})
 
 REGION_MAP = {
     "hokkaido": 0, "nagano": 1, "niigata": 2, "tohoku": 3,  # Japan (trained)
     "nsw": 4, "victoria": 5,                                  # Australia
     "nz_south": 6, "nz_north": 7,                            # New Zealand
     "andes_chile": 8, "andes_argentina": 9,                   # South America
+    "bc_canada": 10,                                          # British Columbia
 }
 
 # The model (XGBoost regression) systematically undershoots big snowfall events
@@ -63,12 +78,39 @@ def powder_score(predicted_snow_cm: float, snow_temp_mean: float, wind_during_sn
     return round(100 * snow_component * 0.6 + 100 * temp_quality * wind_penalty * 0.4)
 
 
+def _in_season(cfg: dict) -> bool:
+    """Return True if today falls within the resort's declared operating season."""
+    opens  = cfg.get("opens_month")
+    closes = cfg.get("closes_month")
+    if opens is None or closes is None:
+        return True
+    m = pd.Timestamp.today().month
+    if opens <= closes:      # SH/simple range e.g. Jun–Oct
+        return opens <= m <= closes
+    else:                    # NH wrap e.g. Nov–Apr
+        return m >= opens or m <= closes
+
+
+def _reopen_str(cfg: dict) -> str:
+    opens = cfg.get("opens_month")
+    return calendar.month_name[opens] if opens else "unknown"
+
+
 def load_model():
     if not MODEL_PATH.exists():
         sys.exit(f"Model not found at {MODEL_PATH}. Run: python -m core.train")
     with open(MODEL_PATH, "rb") as f:
         payload = pickle.load(f)
-    return payload["model"], payload["feature_cols"], payload.get("log_transform", False)
+    return (
+        payload["model"],
+        payload["feature_cols"],
+        payload.get("log_transform", False),
+        payload.get("nwp_amplification_per_resort", {}),
+        payload.get("snow_classifier"),
+        payload.get("snow_gate_threshold", 0.20),
+        payload.get("japan_correction_iso"),
+        payload.get("powder_pred_threshold", 7.0),
+    )
 
 
 def load_calibrations() -> dict:
@@ -79,6 +121,14 @@ def load_calibrations() -> dict:
         return json.load(f)
 
 
+def load_nwp_direct_models() -> dict:
+    """Load per-resort NWP-direct XGBoost calibration models if available."""
+    if not NWP_MODELS_PATH.exists():
+        return {}
+    with open(NWP_MODELS_PATH, "rb") as f:
+        return pickle.load(f)
+
+
 def _apply_calibration(raw_preds: np.ndarray, calib: dict) -> np.ndarray:
     """Apply isotonic calibration mapping via linear interpolation of stored knots."""
     iso_x = np.array(calib["iso_x"])
@@ -87,8 +137,12 @@ def _apply_calibration(raw_preds: np.ndarray, calib: dict) -> np.ndarray:
 
 
 def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
-                    calibrations: dict, days: int = 7,
-                    log_transform: bool = False) -> list[dict]:
+                    calibrations: dict, amp_per_resort: dict, days: int = 7,
+                    log_transform: bool = False, snow_classifier=None,
+                    snow_gate_threshold: float = 0.20,
+                    nwp_direct_models: dict = None,
+                    japan_correction: dict = None,
+                    japan_powder_threshold: float = 7.0) -> list[dict]:
     """Fetch forecast, run model, return list of daily dicts."""
     from datetime import date, timedelta
     today = date.today()
@@ -98,15 +152,27 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
     is_southern = cfg.get("hemisphere") == "south"
     calib       = calibrations.get(resort_id) if is_southern else None
 
-    # Per-resort powder threshold: lower for AU resorts
-    powder_threshold = calib["powder_threshold_raw_equiv"] if calib else POWDER_SCORE_THRESHOLD
+    # Powder threshold: SH resorts use their local ERA5 cm definition (predictions
+    # are in local cm after calibration). Japan NH resorts use the F1-optimal
+    # threshold from training (post-correction, in Japan model output cm).
+    powder_threshold = calib["powder_threshold_local_cm"] if calib else japan_powder_threshold
 
+    # Fetch 35 days of historical data as a rolling-window warmup so that
+    # snowfall_72h, snowfall_7d, snowfall_14d, snowfall_last_30d, and
+    # days_since_last_snow all have valid history on day 1 of the forecast.
+    warmup_start = (today - timedelta(days=35)).strftime("%Y-%m-%d")
+    yesterday    = (today - timedelta(days=1)).strftime("%Y-%m-%d")
     try:
-        hourly = fetch_hourly(cfg["lat"], cfg["lon"], start, end, forecast=True)
+        hourly_hist  = fetch_hourly(cfg["lat"], cfg["lon"], warmup_start, yesterday)
+        hourly_fcast = fetch_hourly(cfg["lat"], cfg["lon"], start, end, forecast=True)
+        hourly = pd.concat([hourly_hist, hourly_fcast])
+        hourly = hourly[~hourly.index.duplicated(keep="last")]
     except Exception as e:
         return [{"error": str(e)}]
 
     daily = build_features(hourly, hemisphere=cfg.get("hemisphere", "north"))
+    # Keep only the forward-looking forecast rows for output
+    daily = daily[daily.index.normalize() >= pd.Timestamp(start)]
 
     # Add static resort features
     daily["resort_id"]   = resort_id
@@ -116,34 +182,59 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
     daily["lat"]         = cfg["lat"]
     daily["lon"]         = cfg["lon"]
 
-    # ── NWP-direct path (AU/NZ): use 48h NWP accumulation as the snowfall signal.
-    # snowfall_24h is what we're predicting; snowfall_48h is the lead indicator
-    # (includes yesterday's snowfall, which is known at forecast time).
-    if calib and calib.get("nwp_direct"):
-        preds = daily["snowfall_48h"].clip(0).values
+    # ── Always set NWP amplification before calling the model ────────────────
+    # For SH Andes resorts (Japan-model path + calibration): use the calibration's
+    # stored factor (fitted on the same data). For all other resorts (Japan NH +
+    # NWP-direct SH): use the per-resort factor stored in the model payload.
+    if calib and not calib.get("nwp_direct"):
+        amp = calib.get("nwp_amplification", 1.0)
     else:
-        # ── Japan model path (Japan + Andes resorts) ──────────────────────────
-        # Inject nwp_amplification from the stored calibration so the amplified
-        # snowfall features match the values seen during training.
-        if calib and not calib.get("nwp_direct"):
-            amp = calib.get("nwp_amplification", 1.0)
-            daily["nwp_amplification"]      = amp
-            daily["amplified_snowfall_24h"] = daily["snowfall_24h"] * amp
-            daily["amplified_snowfall_48h"] = daily["snowfall_48h"] * amp
+        amp = amp_per_resort.get(resort_id, 1.0)
 
+    daily["nwp_amplification"]      = amp
+    daily["amplified_snowfall_24h"] = daily["snowfall_24h"] * amp
+    daily["amplified_snowfall_48h"] = daily["snowfall_48h"] * amp
+
+    if calib and calib.get("nwp_direct"):
+        # ── NWP-direct path (AU/NZ) ───────────────────────────────────────────
+        # Multi-feature XGBoost if available — directly predicts local ERA5 snow cm
+        # from 6 weather features. Falls back to 1D isotonic on snowfall_48h.
+        nwp_model = (nwp_direct_models or {}).get(resort_id)
+        if nwp_model is not None:
+            feats = calib.get("nwp_features", NWP_DIRECT_FEATURES)
+            X_nwp = daily.reindex(columns=feats, fill_value=0.0)
+            X_nwp.replace([np.inf, -np.inf], np.nan, inplace=True)
+            X_nwp.fillna(0.0, inplace=True)
+            preds = nwp_model.predict(X_nwp.values).clip(0)
+            # XGBoost IS the calibration — no isotonic step needed
+        else:
+            raw_nwp = daily["snowfall_48h"].clip(0).values
+            preds = np.where(raw_nwp < 0.3, 0.0, raw_nwp)
+            preds = _apply_calibration(preds, calib)  # 1D isotonic fallback
+    else:
+        # ── Japan model path (NH + Andes) ─────────────────────────────────────
         X = daily.reindex(columns=feat_cols, fill_value=0)
         X.replace([np.inf, -np.inf], np.nan, inplace=True)
-        X.fillna(0, inplace=True)
+        non_hpa = [c for c in X.columns if c not in _HPA_COLS_SET]
+        X[non_hpa] = X[non_hpa].fillna(0.0)
         raw = model.predict(X)
         preds = np.expm1(raw).clip(0) if log_transform else raw.clip(0)
-
-    # ── Transfer calibration ──────────────────────────────────────────────────
-    if calib:
-        preds = _apply_calibration(preds, calib)
+        if snow_classifier is not None:
+            p_snow = snow_classifier.predict_proba(X)[:, 1]
+            preds = preds * (p_snow >= snow_gate_threshold)
+        # Post-hoc Japan correction: stretches the compressed prediction range so
+        # big events (>20cm) are no longer systematically underpredicted.
+        if japan_correction is not None:
+            iso_x = np.array(japan_correction["iso_x"])
+            iso_y = np.array(japan_correction["iso_y"])
+            preds = np.interp(preds, iso_x, iso_y).clip(0)
+        # Andes SH isotonic calibration (maps corrected Japan output → local ERA5 cm)
+        if calib:
+            preds = _apply_calibration(preds, calib)
 
     # ── Physical gate: zero out predictions when too warm to snow ─────────────
     # Applied AFTER calibration so the gate's zeros aren't remapped by the
-    # isotonic curve (iso_y[0] is non-zero, so calibrate(0) ≠ 0).
+    # isotonic curve.
     snow_possible = daily["temp_min"] <= 2.0
     preds = preds * snow_possible.values.astype(float)
 
@@ -155,13 +246,22 @@ def forecast_resort(resort_id: str, cfg: dict, model, feat_cols: list,
             float(row.get("snow_temp_mean",        0)),
             float(row.get("wind_during_snow_mean", 0)),
         )
-        local_threshold = calib["powder_threshold_local_cm"] if calib else None
+        condition = estimate_condition(
+            pred_snow_cm=pred_cm,
+            snowfall_72h=float(row.get("snowfall_72h", 0)),
+            temp_min=float(row.get("temp_min", 0)),
+            temp_max=float(row.get("temp_max", 0)),
+            wind_max=float(row.get("wind_max", 0)),
+            month=date_idx.month,
+            hemisphere=cfg.get("hemisphere", "north"),
+        )
         results.append({
             "date":              str(date_idx.date()),
             "predicted_snow_cm": round(pred_cm, 1),
             "powder_score":      score,
             "is_powder_day":     pred_cm >= powder_threshold,
-            "powder_threshold":  local_threshold or POWDER_SCORE_THRESHOLD,
+            "powder_threshold":  powder_threshold,
+            "condition":         condition,
             "temp_min_c":        round(float(row.get("temp_min",  0)), 1),
             "temp_max_c":        round(float(row.get("temp_max",  0)), 1),
             "wind_max_kmh":      round(float(row.get("wind_max",  0)), 1),
@@ -185,20 +285,24 @@ def render_resort(resort_id: str, days: list[dict]) -> None:
     powder_days = [d for d in days if d["is_powder_day"]]
     best        = max(days, key=lambda d: d["powder_score"])
 
-    sep = "-" * 62
+    _CONDITION_STAR = {"powder", "wind_affected"}
+
+    sep = "-" * 70
     print(f"\n{sep}")
     print(f"  {resort_label}")
     print(f"{sep}")
-    print(f"  {'Date':<12} {'Snow':>6} {'Score':>6}  {'Temp':>14}  {'Wind':>10}  Conditions")
-    print(f"  {'':-<12} {'':->6} {'':->6}  {'':->14}  {'':->10}  {'':->12}")
+    print(f"  {'Date':<12} {'Snow':>6} {'Score':>6}  {'Temp':>14}  {'Wind':>10}  Condition")
+    print(f"  {'':-<12} {'':->6} {'':->6}  {'':->14}  {'':->10}  {'':->14}")
 
     for d in days:
-        snow  = f"{d['predicted_snow_cm']}cm"
-        score = f"{d['powder_score']}/100"
-        temp  = f"{d['temp_min_c']} to {d['temp_max_c']}C"
-        wind  = f"{d['wind_mean_kmh']}kmh"
-        tag   = "*** POWDER ***" if d["is_powder_day"] else ""
-        print(f"  {d['date']:<12} {snow:>6} {score:>6}  {temp:>10}  {wind:>10}  {tag}")
+        snow      = f"{d['predicted_snow_cm']}cm"
+        score     = f"{d['powder_score']}/100"
+        temp      = f"{d['temp_min_c']} to {d['temp_max_c']}C"
+        wind      = f"{d['wind_mean_kmh']}kmh"
+        cond      = d.get("condition", "variable")
+        star      = " ***" if d["is_powder_day"] else ""
+        cond_col  = f"[{cond}]{star}"
+        print(f"  {d['date']:<12} {snow:>6} {score:>6}  {temp:>10}  {wind:>10}  {cond_col}")
 
     print()
     if powder_days:
@@ -224,19 +328,27 @@ def main():
             sys.exit(f"Resort '{args.resort}' not in regions.yaml. Available: {', '.join(regions)}")
         targets = {args.resort: regions[args.resort]}
     else:
-        targets = regions
+        targets = {rid: cfg for rid, cfg in regions.items() if not cfg.get("hidden")}
 
-    model, feat_cols, log_transform = load_model()
-    calibrations = load_calibrations()
-    if calibrations:
+    model, feat_cols, log_transform, amp_per_resort, snow_classifier, \
+        snow_gate_threshold, japan_correction, japan_powder_threshold = load_model()
+    calibrations      = load_calibrations()
+    nwp_direct_models = load_nwp_direct_models()
+    if calibrations and not args.json:
         print(f"  Loaded transfer calibration for: {', '.join(calibrations)}")
+    if nwp_direct_models and not args.json:
+        print(f"  Loaded NWP-direct XGBoost models for: {', '.join(nwp_direct_models)}")
 
     all_results = {}
     for resort_id, cfg in targets.items():
-        print(f"  Fetching forecast for {resort_id} ...", end="\r")
+        if not args.json:
+            print(f"  Fetching forecast for {resort_id} ...", end="\r")
         all_results[resort_id] = forecast_resort(
-            resort_id, cfg, model, feat_cols, calibrations,
+            resort_id, cfg, model, feat_cols, calibrations, amp_per_resort,
             days=args.days, log_transform=log_transform,
+            snow_classifier=snow_classifier, snow_gate_threshold=snow_gate_threshold,
+            nwp_direct_models=nwp_direct_models, japan_correction=japan_correction,
+            japan_powder_threshold=japan_powder_threshold,
         )
 
     if args.json:
@@ -244,9 +356,9 @@ def main():
         return
 
     # ── Formatted output ──────────────────────────────────────────────────────
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 70)
     print("  POWDER FORECAST")
-    print("=" * 62)
+    print("=" * 70)
 
     # Sort resorts: powder days first, then by best score
     def sort_key(item):
@@ -258,16 +370,21 @@ def main():
         return (0, 0)
 
     for resort_id, days_list in sorted(all_results.items(), key=sort_key):
+        cfg = targets[resort_id]
+        if not _in_season(cfg):
+            resort_label = resort_id.replace("_", " ").title()
+            print(f"\n  {resort_label}: Off-season  (season opens {_reopen_str(cfg)})")
+            continue
         render_resort(resort_id, days_list)
 
-    print("\n" + "=" * 62)
+    print("\n" + "=" * 70)
     thresholds = {r: d[0]["powder_threshold"] for r, d in all_results.items()
                   if d and "error" not in d[0] and "powder_threshold" in d[0]}
     unique_thr = sorted(set(thresholds.values()))
     for thr in unique_thr:
         resorts = [r for r, t in thresholds.items() if t == thr]
         print(f"  Powder threshold >={thr}cm: {', '.join(r.replace('_',' ') for r in resorts)}")
-    print("=" * 62 + "\n")
+    print("=" * 70 + "\n")
 
 
 if __name__ == "__main__":

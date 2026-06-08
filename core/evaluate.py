@@ -27,6 +27,9 @@ MODEL_PATH   = Path("data/models/xgb_overnight_snow.pkl")
 TARGET       = "overnight_snow_cm"
 POWDER_CM    = 15.0
 
+_HPA_COLS = {"temp_850_mean", "temp_850_min", "temp_850_max",
+             "temp_850_trend", "rain_risk_850", "freeze_depth_850"}
+
 
 def load_model(path: Path = MODEL_PATH):
     with open(path, "rb") as f:
@@ -37,18 +40,31 @@ def load_model(path: Path = MODEL_PATH):
 def _prep_X(df: pd.DataFrame, feat_cols: list) -> pd.DataFrame:
     X = df.reindex(columns=feat_cols, fill_value=0.0)
     X.replace([np.inf, -np.inf], np.nan, inplace=True)
-    X.fillna(0.0, inplace=True)
+    # Keep 850hPa NaN so XGBoost routes pre-2021 rows correctly (0°C at 850hPa
+    # is a real weather state — filling with 0 would be wrong).
+    non_hpa = [c for c in X.columns if c not in _HPA_COLS]
+    X[non_hpa] = X[non_hpa].fillna(0.0)
     return X
 
 
-def _predict(model, feat_cols: list, df: pd.DataFrame, log_transform: bool) -> np.ndarray:
+def _predict(model, feat_cols: list, df: pd.DataFrame, log_transform: bool,
+             snow_classifier=None, snow_gate_threshold: float = 0.20,
+             japan_correction: dict = None) -> np.ndarray:
     X = _prep_X(df, feat_cols)
     raw = model.predict(X)
     preds = np.expm1(raw).clip(0) if log_transform else raw.clip(0)
+    if snow_classifier is not None:
+        p_snow = snow_classifier.predict_proba(X)[:, 1]
+        preds = preds * (p_snow >= snow_gate_threshold)
+    if japan_correction is not None:
+        iso_x = np.array(japan_correction["iso_x"])
+        iso_y = np.array(japan_correction["iso_y"])
+        preds = np.interp(preds, iso_x, iso_y).clip(0)
     return preds
 
 
-def _metrics_row(y_true: np.ndarray, y_pred: np.ndarray, powder_pred_thresh: float) -> dict:
+def _metrics_row(y_true: np.ndarray, y_pred: np.ndarray, powder_pred_thresh: float,
+                 actual_powder_cm: float = POWDER_CM) -> dict:
     if len(y_true) < 5:
         return {}
     mae  = mean_absolute_error(y_true, y_pred)
@@ -58,7 +74,7 @@ def _metrics_row(y_true: np.ndarray, y_pred: np.ndarray, powder_pred_thresh: flo
     snow  = y_true >= 1.0
     r_sn  = pearsonr(y_pred[snow], y_true[snow])[0] if snow.sum() > 5 and y_true[snow].std() > 0 else float("nan")
 
-    actual_p = y_true >= POWDER_CM
+    actual_p = y_true >= actual_powder_cm
     pred_p   = y_pred >= powder_pred_thresh
     tp = (actual_p & pred_p).sum()
     fp = (~actual_p & pred_p).sum()
@@ -80,6 +96,9 @@ def evaluate(run_loro: bool = False) -> None:
     holdout      = payload.get("holdout_season", "2022-2023")
     train_m      = payload.get("train_metrics", {})
     test_m_saved = payload.get("test_metrics", {})
+    snow_classifier     = payload.get("snow_classifier")
+    snow_gate_threshold = payload.get("snow_gate_threshold", 0.20)
+    japan_correction    = payload.get("japan_correction_iso")
 
     df = pd.read_parquet(DATASET_PATH)
     train_df = df[df["season"] <  holdout]
@@ -88,10 +107,13 @@ def evaluate(run_loro: bool = False) -> None:
     # Use the threshold calibrated at training time (stored in the payload)
     powder_pred_thresh = payload.get("powder_pred_threshold", POWDER_CM * 0.5)
     print(f"  Powder detection threshold (predicted cm): {powder_pred_thresh:.2f}")
+    if japan_correction:
+        print(f"  Japan post-hoc correction loaded ({len(japan_correction['iso_x'])} knots)")
 
     # ── Overall metrics ───────────────────────────────────────────────────────
     y_te = test_df[TARGET].values
-    p_te = _predict(model, feat_cols, test_df, log_transform)
+    p_te = _predict(model, feat_cols, test_df, log_transform,
+                    snow_classifier, snow_gate_threshold, japan_correction)
 
     m = _metrics_row(y_te, p_te, powder_pred_thresh)
     stored_r = test_m_saved.get("r", "N/A")
@@ -109,6 +131,32 @@ def evaluate(run_loro: bool = False) -> None:
         print(f"\n  Train r={train_m.get('r','?')}  ->  Test r={m['r']:.3f}  "
               f"(gap = {m['r'] - train_m.get('r', m['r']):.3f})")
 
+    # ── Hemisphere-split metrics ───────────────────────────────────────────────
+    POWDER_THRESHOLDS_BY_HEMI = {"north": 15.0, "south": 4.0}
+    test_df_copy = test_df.copy()
+    test_df_copy["pred"] = p_te
+
+    if "hemisphere" in test_df_copy.columns:
+        print(f"\n{'=' * 60}")
+        print(f"  HEMISPHERE-SPLIT METRICS (test set)")
+        print(f"{'=' * 60}")
+        for hemi, hemi_df in sorted(test_df_copy.groupby("hemisphere")):
+            y_h   = hemi_df[TARGET].values
+            p_h   = hemi_df["pred"].values
+            thr_h = POWDER_THRESHOLDS_BY_HEMI.get(hemi, POWDER_CM)
+            from core.train import _find_best_threshold
+            hemi_thr = _find_best_threshold(y_h, p_h, powder_cm=thr_h)
+            mh = _metrics_row(y_h, p_h, hemi_thr)
+            if not mh:
+                continue
+            resorts_h = sorted(hemi_df["resort_id"].unique())
+            print(f"\n  {hemi.upper()} ({len(resorts_h)} resorts)")
+            print(f"  Resorts: {', '.join(resorts_h)}")
+            print(f"  n={mh['n']:,}  MAE={mh['mae']:.2f}cm  r={mh['r']:.3f}")
+            print(f"  Powder (actual>={thr_h}cm, pred>={hemi_thr:.1f}cm):")
+            print(f"    Precision={mh['prec']:.3f}  Recall={mh['rec']:.3f}  F1={mh['f1']:.3f}")
+            print(f"    TP={mh['tp']}  FP={mh['fp']}  FN={mh['fn']}")
+
     # ── Per-resort breakdown ──────────────────────────────────────────────────
     sep = "-" * 60
     print(f"\n{sep}")
@@ -117,16 +165,16 @@ def evaluate(run_loro: bool = False) -> None:
     print(f"  {'Resort':<25} {'n':>5} {'r':>6} {'r_snow':>7} {'MAE':>7} {'F1':>6} {'powder_days':>12}")
     print(f"  {'':-<25} {'':->5} {'':->6} {'':->7} {'':->7} {'':->6} {'':->12}")
 
-    test_df = test_df.copy()
-    test_df["pred"] = p_te
-
-    for resort, grp in sorted(test_df.groupby("resort_id")):
-        mr = _metrics_row(grp[TARGET].values, grp["pred"].values, powder_pred_thresh)
+    for resort, grp in sorted(test_df_copy.groupby("resort_id")):
+        hemi_grp = grp["hemisphere"].iloc[0] if "hemisphere" in grp.columns else "north"
+        resort_powder_cm = POWDER_THRESHOLDS_BY_HEMI.get(hemi_grp, POWDER_CM)
+        mr = _metrics_row(grp[TARGET].values, grp["pred"].values, powder_pred_thresh,
+                          actual_powder_cm=resort_powder_cm)
         if not mr:
             continue
         print(f"  {resort:<25} {mr['n']:>5} {mr['r']:>6.3f} {mr['r_snow']:>7.3f} "
               f"{mr['mae']:>6.2f}cm {mr['f1']:>6.3f} "
-              f"{mr['tp']:>5}/{(grp[TARGET]>=POWDER_CM).sum():<5}")
+              f"{mr['tp']:>5}/{(grp[TARGET]>=resort_powder_cm).sum():<5}")
 
     # ── Leave-one-resort-out ──────────────────────────────────────────────────
     if not run_loro:
@@ -141,7 +189,7 @@ def evaluate(run_loro: bool = False) -> None:
     print(f"  {'Resort':<25} {'r':>6} {'MAE':>7} {'F1':>6} {'n_test':>7}")
     print(f"  {'':-<25} {'':->6} {'':->7} {'':->6} {'':->7}")
 
-    from core.train import FEATURE_COLS as FEAT
+    from core.train import FEATURE_COLS as FEAT, _find_best_threshold
 
     for held_out in resorts:
         tr = df[df["resort_id"] != held_out]
@@ -153,16 +201,28 @@ def evaluate(run_loro: bool = False) -> None:
         y_te = te[TARGET].values
 
         m_loro = XGBRegressor(
-            n_estimators=300, max_depth=4, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8,
-            min_child_weight=5, random_state=42, n_jobs=-1,
+            n_estimators          = 800,
+            max_depth             = 5,
+            learning_rate         = 0.04,
+            subsample             = 0.8,
+            colsample_bytree      = 0.8,
+            min_child_weight      = 7,
+            reg_alpha             = 0.1,
+            reg_lambda            = 1.0,
+            objective             = "reg:tweedie",
+            tweedie_variance_power= 1.2,
+            random_state          = 42,
+            n_jobs                = -1,
         )
-        m_loro.fit(X_tr, np.log1p(y_tr), verbose=False)
-        p = np.expm1(m_loro.predict(X_te)).clip(0)
+        m_loro.fit(X_tr, y_tr, verbose=False)
+        p_tr = m_loro.predict(X_tr).clip(0)
+        p_te = m_loro.predict(X_te).clip(0)
 
-        ap = y_te >= POWDER_CM
-        thr = float(np.percentile(p[ap], 25)) if ap.sum() >= 5 else POWDER_CM * 0.5
-        mr = _metrics_row(y_te, p, thr)
+        # Threshold derived from training data only (not from the held-out resort)
+        japan_mask = (tr["hemisphere"] == "north").values if "hemisphere" in tr.columns \
+                     else np.ones(len(y_tr), dtype=bool)
+        thr = _find_best_threshold(y_tr[japan_mask], p_tr[japan_mask], powder_cm=POWDER_CM)
+        mr = _metrics_row(y_te, p_te, thr)
         if not mr:
             continue
         print(f"  {held_out:<25} {mr['r']:>6.3f} {mr['mae']:>6.2f}cm "

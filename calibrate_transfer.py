@@ -30,20 +30,34 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LinearRegression
+from xgboost import XGBRegressor
 
 from collectors.weather import fetch_and_cache
 from core.features import build_features
 
-MODEL_PATH   = Path("data/models/xgb_overnight_snow.pkl")
-CALIB_OUT    = Path("data/models/transfer_calibration.json")
-REGIONS_YAML = Path("regions.yaml")
-PLOTS_DIR    = Path("data/plots")
+MODEL_PATH          = Path("data/models/xgb_overnight_snow.pkl")
+NWP_MODELS_PATH     = Path("data/models/nwp_direct_models.pkl")
+CALIB_OUT           = Path("data/models/transfer_calibration.json")
+REGIONS_YAML        = Path("regions.yaml")
+PLOTS_DIR           = Path("data/plots")
+SH_LABELS_PATH      = Path("data/processed/sh_labels.csv")
+
+# Features used by the NWP-direct multi-feature calibration model.
+# These are all available from build_features() so no extra fetching is needed.
+NWP_DIRECT_FEATURES = [
+    "snowfall_48h",
+    "snowfall_72h",
+    "temp_min",
+    "hours_with_snow",
+    "precipitation",
+    "pressure_tendency_24h",
+]
 
 SH_SEASON_MONTHS = {6, 7, 8, 9}
 REGION_MAP = {
     "hokkaido": 0, "nagano": 1, "niigata": 2, "tohoku": 3,
     "nsw": 4, "victoria": 5, "nz_south": 6, "nz_north": 7,
-    "andes_chile": 8, "andes_argentina": 9,
+    "andes_chile": 8, "andes_argentina": 9, "bc_canada": 10,
 }
 
 # Regions where the Japan model has usable signal (r ≥ ~0.3 before calibration).
@@ -66,16 +80,18 @@ RESORTS_POWDER_THRESHOLD = {
     "las_lenas":         4.0,
     "catedral_bariloche":4.0,
 }
-# Keep old name as alias for backward compat
-RESORTINFO_POWDER_THRESHOLD = RESORTS_POWDER_THRESHOLD
-RESORTS_POWDER_THRESHOLD.setdefault  # no-op, just for clarity
 DEFAULT_POWDER_THRESHOLD = 4.0
 
 
 def load_model():
     with open(MODEL_PATH, "rb") as f:
         p = pickle.load(f)
-    return p["model"], p["feature_cols"], p.get("log_transform", False)
+    return (
+        p["model"],
+        p["feature_cols"],
+        p.get("log_transform", False),
+        p.get("japan_correction_iso"),
+    )
 
 
 def run_nwp_direct(resort_id: str, cfg: dict,
@@ -83,29 +99,46 @@ def run_nwp_direct(resort_id: str, cfg: dict,
     """
     NWP-direct path for regions where the Japan model has no useful signal.
 
-    The 'prediction' is the 48h rolling NWP snowfall (a lead indicator),
-    and the 'proxy label' is today's NWP snowfall.  This is NOT circular —
-    the rolling window uses yesterday+today's weather to predict today's snowfall,
-    which is a genuine forecast signal.  The previous approach set both sides
-    to snowfall_24h, producing r=1.000 (correlation of a variable with itself).
+    Prediction: 48h rolling NWP snowfall (genuine lead indicator).
+    Label: ERA5 snow_depth change (independent observed state variable).
+    Falls back to NWP snowfall_24h only if ERA5 labels are not available.
     """
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly, hemisphere=cfg.get("hemisphere", "north"))
-
-    # No gate here — calibration input must match forecast.py which now applies the
-    # physical gate AFTER calibration (iso_y[0] is non-zero, so gate must be last).
     daily["japan_model_raw"] = daily["snowfall_48h"].clip(0)
-    # Label: today's NWP snowfall (independent of the 48h window when used at t+1)
-    daily["proxy_snow_cm"]   = daily["snowfall_24h"].clip(0)
+
+    # Prefer real observed labels (LivePass / resort snapshot) over ERA5 proxy.
+    # When ≥30 days of observed snow_24h_cm exist, the direct measurement is used;
+    # otherwise fall back to ERA5 snow_depth change (independent of NWP features).
+    snapshot_path = Path("data/raw/snow_reports") / f"{resort_id}.csv"
+    if snapshot_path.exists():
+        snaps = pd.read_csv(snapshot_path, parse_dates=["date"])
+        valid_snaps = snaps[snaps["snow_24h_cm"].notna() & (snaps["snow_24h_cm"] >= 0)]
+        if len(valid_snaps) >= 30:
+            snap_map = valid_snaps.set_index("date")["snow_24h_cm"]
+            daily["proxy_snow_cm"] = daily.index.normalize().map(snap_map).fillna(0.0)
+            print(f"    [{resort_id}] Using observed LivePass labels ({len(valid_snaps)} days) as proxy")
+        else:
+            print(f"    [{resort_id}] Only {len(valid_snaps)} observed days — need ≥30 for LivePass proxy, using ERA5")
+            snapshot_path = None  # fall through to ERA5
+    if not snapshot_path or not snapshot_path.exists() or "proxy_snow_cm" not in daily.columns:
+        if SH_LABELS_PATH.exists():
+            sh_lab = pd.read_csv(SH_LABELS_PATH, parse_dates=["date"])
+            sh_lab = sh_lab[sh_lab["resort_id"] == resort_id].copy()
+            sh_lab["date"] = sh_lab["date"].dt.normalize()
+            era5_map = sh_lab.set_index("date")["new_snow_cm"]
+            daily["proxy_snow_cm"] = daily.index.normalize().map(era5_map).fillna(0.0)
+            print(f"    [{resort_id}] Using ERA5 snow_depth labels as proxy")
+        else:
+            print(f"    [{resort_id}] WARNING: no labels found, falling back to NWP proxy (r values will be inflated)")
+            daily["proxy_snow_cm"] = daily["snowfall_24h"].clip(0)
 
     return daily[daily.index.month.isin(SH_SEASON_MONTHS)].copy()
 
 
-SH_LABELS_PATH = Path("data/processed/sh_labels.csv")
-
-
 def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
-                    start: str, end: str, log_transform: bool = False) -> pd.DataFrame:
+                    start: str, end: str, log_transform: bool = False,
+                    japan_correction: dict = None) -> pd.DataFrame:
     """Fetch historical weather and get Japan-model raw predictions."""
     hourly = fetch_and_cache(resort_id, cfg["lat"], cfg["lon"], start=start, end=end)
     daily  = build_features(hourly, hemisphere="south")
@@ -148,19 +181,28 @@ def run_japan_model(resort_id: str, cfg: dict, model, feat_cols: list,
     _raw = model.predict(X)
     raw_preds = np.expm1(_raw).clip(0) if log_transform else _raw.clip(0)
 
-    # No gate — must match forecast.py which gates AFTER calibration
+    # Apply Japan post-hoc correction so the SH calibration is fitted on the same
+    # scale of predictions that forecast.py produces at inference time.
+    if japan_correction is not None:
+        iso_x = np.array(japan_correction["iso_x"])
+        iso_y = np.array(japan_correction["iso_y"])
+        raw_preds = np.interp(raw_preds, iso_x, iso_y).clip(0)
+
+    # No classifier gate — must match forecast.py which gates AFTER calibration
     daily["japan_model_raw"] = raw_preds
 
     return daily[daily.index.month.isin(SH_SEASON_MONTHS)].copy()
 
 
-def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float) -> dict:
+def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float,
+                    nwp_direct: bool = False) -> tuple | None:
     """
-    Fit isotonic regression from Japan model output -> proxy snowfall.
-    Only use days where either the model or Open-Meteo shows some snow signal,
-    to avoid fitting noise on zero-zero pairs.
+    Fit calibration from Japan model output (or NWP snowfall for NWP-direct) ->
+    proxy snowfall. Only use days where either source shows a non-trivial signal.
+
+    Returns (result_dict, iso_for_plotting, xgb_model_or_None).
+    xgb_model is a multi-feature XGBRegressor for NWP-direct resorts; None for Andes.
     """
-    # Use days where the Japan model or proxy shows at least a small signal
     mask = (df["japan_model_raw"] > 0.3) | (df["proxy_snow_cm"] > 0.3)
     calib_df = df[mask].copy()
 
@@ -168,62 +210,82 @@ def fit_calibration(df: pd.DataFrame, resort_id: str, powder_threshold: float) -
         print(f"  WARNING: only {len(calib_df)} usable rows for calibration at {resort_id}")
         return None
 
-    X = calib_df["japan_model_raw"].values.reshape(-1, 1)
-    y = calib_df["proxy_snow_cm"].values
+    x_vals = calib_df["japan_model_raw"].values
+    y      = calib_df["proxy_snow_cm"].values
 
-    # Isotonic regression (monotone)
+    # Anchor at (0, 0) so zero model output maps to zero predicted snowfall.
+    x_fit = np.concatenate([[0.0], x_vals])
+    y_fit = np.concatenate([[0.0], y])
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(calib_df["japan_model_raw"].values, y)
+    iso.fit(x_fit, y_fit)
 
-    # Also fit a simple linear for reference
-    lin = LinearRegression().fit(X, y)
+    lin    = LinearRegression().fit(x_vals.reshape(-1, 1), y)
     scale  = float(lin.coef_[0])
     offset = float(lin.intercept_)
 
-    # Find what Japan-model raw output corresponds to the local powder threshold.
-    # Data-driven approach: take the median Japan model prediction on days when
-    # local snowfall actually reached the powder threshold.  This is robust to
-    # near-zero linear scale (which caused the old formula to blow up).
     MODEL_MAX_CM = 22.0
     powder_days_mask = calib_df["proxy_snow_cm"] >= powder_threshold
     if powder_days_mask.sum() >= 5:
         raw_at_powder = float(calib_df.loc[powder_days_mask, "japan_model_raw"].median())
     else:
-        # Very few powder days in calibration data — use 90th percentile of raw
-        # predictions as a conservative threshold.
         raw_at_powder = float(calib_df["japan_model_raw"].quantile(0.90))
     raw_at_powder = float(np.clip(raw_at_powder, 0.0, MODEL_MAX_CM))
 
-    # Evaluate calibrated r on snow days
     snow_days = df["proxy_snow_cm"] > 0.1
     if snow_days.sum() > 10:
         calibrated_preds = iso.predict(df.loc[snow_days, "japan_model_raw"].values)
         proxy            = df.loc[snow_days, "proxy_snow_cm"].values
-        r = float(np.corrcoef(calibrated_preds, proxy)[0, 1])
+        r     = float(np.corrcoef(calibrated_preds, proxy)[0, 1])
         r_raw = float(np.corrcoef(df.loc[snow_days, "japan_model_raw"].values, proxy)[0, 1])
     else:
         r = r_raw = float("nan")
 
-    # Store nwp_amplification factor (from Japan-model path; 1.0 for NWP-direct)
     amp_factor = float(calib_df["nwp_amplification"].iloc[0]) \
         if "nwp_amplification" in calib_df.columns else 1.0
 
     result = {
-        "resort_id":           resort_id,
-        "n_calib_rows":        len(calib_df),
-        "linear_scale":        round(scale, 4),
-        "linear_offset":       round(offset, 4),
+        "resort_id":                  resort_id,
+        "n_calib_rows":               len(calib_df),
+        "linear_scale":               round(scale, 4),
+        "linear_offset":              round(offset, 4),
         "powder_threshold_local_cm":  powder_threshold,
         "powder_threshold_raw_equiv": round(raw_at_powder, 3),
-        "r_before_calib":      round(r_raw, 3),
-        "r_after_calib":       round(r, 3),
-        "nwp_amplification":   round(amp_factor, 3),
-        # Store the isotonic mapping as sorted x/y arrays for serialisation
-        "iso_x": iso.X_thresholds_.tolist(),
-        "iso_y": iso.y_thresholds_.tolist(),
-        "nwp_direct": False,  # set to True by caller for NWP-direct resorts
+        "r_before_calib":             round(r_raw, 3),
+        "r_after_calib":              round(r, 3),
+        "nwp_amplification":          round(amp_factor, 3),
+        "iso_x":                      iso.X_thresholds_.tolist(),
+        "iso_y":                      iso.y_thresholds_.tolist(),
+        "nwp_direct":                 nwp_direct,
     }
-    return result, iso
+
+    # For NWP-direct resorts, additionally fit a multi-feature XGBoost that uses
+    # temp, hours_with_snow, and pressure in addition to snowfall. This better
+    # discriminates rain events and gives higher calibration r than 1D isotonic.
+    xgb_cal = None
+    if nwp_direct:
+        feats_avail = [f for f in NWP_DIRECT_FEATURES if f in df.columns]
+        if len(feats_avail) >= 3:
+            X_full = df.reindex(columns=feats_avail, fill_value=0.0)
+            X_full.replace([np.inf, -np.inf], np.nan, inplace=True)
+            X_full.fillna(0.0, inplace=True)
+            X_cal  = calib_df.reindex(columns=feats_avail, fill_value=0.0).fillna(0.0)
+            xgb_cal = XGBRegressor(
+                n_estimators=100, max_depth=3, learning_rate=0.1,
+                subsample=0.8, colsample_bytree=0.8,
+                objective="reg:tweedie", tweedie_variance_power=1.2,
+                random_state=42, n_jobs=-1,
+            )
+            xgb_cal.fit(X_cal.values, y)
+            if snow_days.sum() > 10:
+                xgb_snow = xgb_cal.predict(X_full[snow_days.values].values).clip(0)
+                r_xgb = float(np.corrcoef(xgb_snow, df.loc[snow_days, "proxy_snow_cm"].values)[0, 1])
+                print(f"    [{resort_id}] XGBoost multi-feature r = {r_xgb:.3f}  "
+                      f"(vs 1D isotonic r = {r:.3f})")
+                result["r_xgb_calib"] = round(r_xgb, 3)
+            result["nwp_features"]    = feats_avail
+            result["xgb_nwp_direct"]  = True
+
+    return result, iso, xgb_cal
 
 
 def plot_calibration(df: pd.DataFrame, iso, resort_id: str, calib: dict) -> None:
@@ -246,7 +308,7 @@ def plot_calibration(df: pd.DataFrame, iso, resort_id: str, calib: dict) -> None
     axes[0].axhline(calib["powder_threshold_local_cm"], color="gold", linestyle=":",
                     linewidth=1.5)
     axes[0].set_xlabel("Japan model raw output (cm)")
-    axes[0].set_ylabel("Open-Meteo proxy snowfall (cm)")
+    axes[0].set_ylabel("Proxy label (ERA5 snow_depth change or NWP, cm)")
     axes[0].set_title(f"Raw vs Proxy  (r_raw={calib['r_before_calib']:.3f})")
     axes[0].legend(fontsize=8)
 
@@ -287,9 +349,10 @@ def main():
     if args.resort:
         sh_resorts = {args.resort: sh_resorts[args.resort]}
 
-    model, feat_cols, log_transform = load_model()
+    model, feat_cols, log_transform, japan_correction = load_model()
 
-    all_calibrations = {}
+    all_calibrations  = {}
+    nwp_direct_models = {}
 
     # Load existing calibrations if any
     if CALIB_OUT.exists():
@@ -298,24 +361,28 @@ def main():
 
     print(f"\nFitting transfer calibration for {len(sh_resorts)} resort(s)")
     print(f"Data: {args.start} -> {args.end}")
+    if japan_correction:
+        print(f"  Japan post-hoc correction loaded from model payload ({len(japan_correction['iso_x'])} knots)")
     print()
 
     for resort_id, cfg in sh_resorts.items():
         powder_thr = args.powder_threshold or RESORTS_POWDER_THRESHOLD.get(resort_id, DEFAULT_POWDER_THRESHOLD)
         use_nwp = cfg.get("region", "") not in JAPAN_MODEL_REGIONS
-        method = "NWP-direct" if use_nwp else "Japan model"
+        method = "NWP-direct (XGBoost)" if use_nwp else "Japan model (corrected)"
         print(f"  {resort_id}  (powder threshold: {powder_thr}cm, method: {method}) ...")
 
         if use_nwp:
             df = run_nwp_direct(resort_id, cfg, args.start, args.end)
         else:
-            df = run_japan_model(resort_id, cfg, model, feat_cols, args.start, args.end, log_transform)
+            df = run_japan_model(resort_id, cfg, model, feat_cols, args.start, args.end,
+                                 log_transform, japan_correction)
 
-        result = fit_calibration(df, resort_id, powder_thr)
+        result = fit_calibration(df, resort_id, powder_thr, nwp_direct=use_nwp)
         if result is None:
             continue
-        calib, iso = result
-        calib["nwp_direct"] = use_nwp
+        calib, iso, xgb_cal = result
+        if xgb_cal is not None:
+            nwp_direct_models[resort_id] = xgb_cal
 
         plot_calibration(df, iso, resort_id, calib)
 
@@ -331,6 +398,12 @@ def main():
     with open(CALIB_OUT, "w") as f:
         json.dump(all_calibrations, f, indent=2)
     print(f"Calibrations saved -> {CALIB_OUT}")
+
+    if nwp_direct_models:
+        with open(NWP_MODELS_PATH, "wb") as f:
+            pickle.dump(nwp_direct_models, f)
+        print(f"NWP-direct XGBoost models saved -> {NWP_MODELS_PATH}  "
+              f"({len(nwp_direct_models)} resorts)")
     print()
     print("-" * 60)
     print("SUMMARY")
